@@ -491,6 +491,24 @@ class Profiler:
         print(f"  [{tot * 1e3:8.1f} ms] 100.0%  TOTAL (end to end)")
 
 
+# --- per-source NMS scores (port of prod detector scores) --------------------
+# Prod's NMS sorts by (score desc, area desc); each detector stamps a fixed
+# score so geometric wins overlaps, then color, then bordered "loses ties"
+# (bordered_detector.py: score 0.45 "< color (0.5..1.0) & geometric (1.0)").
+# The GPU previously flattened every box to 1.0, which let color/bordered
+# survive overlaps prod would discard -- skewing the source mix vs prod.
+_SOURCE_SCORE = {
+    "opencv_strict": 1.0,   # geometric: highest, wins overlaps
+    "color": 0.75,          # prod 0.5+0.5*fill; GPU has no fill -> mid value < 1.0
+    "bordered": 0.45,       # prod bordered: loses ties to geometric/color
+    "bigregion": 1.0,       # recovered halls/stages: keep
+}
+
+
+def _source_score(source):
+    return _SOURCE_SCORE.get(source, 1.0)
+
+
 # --- false-positive policy (port of prod app/adaptive/labeling.py) -----------
 # shape sources are trusted on their own geometry (no text required); the
 # geometric pass ("opencv_strict") is kept unless its cell is provably empty.
@@ -598,7 +616,7 @@ def run(args):
                                      edge=args.seam_edge):
                         continue                         # neighbour tile holds it whole
                     rec = {"bbox": [bx1 + gx0, by1 + gy0, bx2 + gx0, by2 + gy0],
-                           "score": 1.0, "source": sb["source"]}
+                           "score": _source_score(sb["source"]), "source": sb["source"]}
                     if sb.get("coords"):
                         rec["coords"] = [[p[0] + gx0, p[1] + gy0] for p in sb["coords"]]
                     pool.append(rec)
@@ -608,7 +626,7 @@ def run(args):
         boxes, mask_full, m_ms, c_ms = _detect_on_crop(img, bands, device, args,
                                                        geo_params=geo_params)
         mask_ms_tot += m_ms; cc_ms_tot += c_ms
-        pool = [{"bbox": [float(v) for v in b["xyxy"]], "score": 1.0,
+        pool = [{"bbox": [float(v) for v in b["xyxy"]], "score": _source_score(b["source"]),
                  "source": b["source"], **({"coords": b["coords"]} if b.get("coords") else {})}
                 for b in boxes]
 

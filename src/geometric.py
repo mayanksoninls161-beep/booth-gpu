@@ -38,7 +38,7 @@ class GeoParams:
     # internal cut lines
     cut_contrast: int = 22
     bright_contrast: int = 255
-    line_len_frac: float = 0.03
+    line_len_frac: float = 0.020
     color_edge_sat: int = 55
     close_gap: int = 3
     # gray walkway
@@ -46,9 +46,9 @@ class GeoParams:
     gray_walk_v_hi: int = 205
     gray_walk_frac: float = 0.015
     # cell geometry filters (fractions of WORKING image area)
-    min_area_frac: float = 1e-4
+    min_area_frac: float = 8e-5
     max_area_frac: float = 0.06
-    min_side_px: int = 20
+    min_side_px: int = 12
     min_rect_score: float = 0.60
     min_aspect: float = 0.14
     # tilt
