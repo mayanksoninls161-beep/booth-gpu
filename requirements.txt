@@ -1,0 +1,7 @@
+# Colab already ships torch + CUDA; these cover a clean environment too.
+# On Colab you usually only need: pip install opencv-python-headless
+torch>=2.0
+numpy>=1.24
+opencv-python-headless>=4.8
+# optional: faster OCR test
+# easyocr>=1.7
