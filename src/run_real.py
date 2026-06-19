@@ -12,6 +12,15 @@ synthetic or pool fixtures). Pipeline, all on GPU:
     -> dedup / merge                         gpu_merge.nms_gpu_cluster (or assisted)
     -> draw boxes (no labels) + save PNGs
 
+For DENSE plans the detect stage runs TILED by default (--tile 1800 --overlap
+400, ported from prod's app/adaptive/tiling.py): the page is cut into overlapping
+crops, each crop is colour-masked + connected-component'd on its own, boxes that
+touch an inner seam are dropped (the neighbour tile holds them whole), the rest
+are offset back to global coordinates and fused by ONE global GPU merge. Tiling
+both recovers the tiny cells a single full-page pass fuses / min-area-drops AND
+speeds the GPU connected-components (smaller crops converge in far fewer
+label-prop rounds). Pass --tile 0 to force the old single full-image pass.
+
 Masking is done in HSV space (the GPU ops are channel-order agnostic, so we feed
 HSV planes + HSV bounds) because exhibition booths are far easier to isolate by
 hue than by raw BGR. By default we auto-detect the dominant saturated hues; pass
@@ -118,6 +127,85 @@ def auto_hsv_bands(img_bgr, k=3, s_min=60, v_min=60, hue_halfwidth=8):
 
 
 # --------------------------------------------------------------------------- #
+# tiling: overlapping crops so dense little cells survive (ported from prod's
+# app/adaptive/tiling.py). A whole-page render shrinks each booth below the
+# min-area filter and fuses abutting cells; cropping makes each cell a healthy
+# fraction of *its tile* so CC traces it on its own, AND each crop is small so
+# the GPU label-prop converges in far fewer rounds.
+# --------------------------------------------------------------------------- #
+_SEAM_EDGE = 4  # px: a box within this of an inner tile margin is "clipped"
+
+
+def _tile_origins(extent, tile, step):
+    """Tile start offsets so the last tile always reaches `extent`."""
+    if extent <= tile:
+        return [0]
+    xs, x = [], 0
+    while True:
+        xs.append(x)
+        if x + tile >= extent:
+            break
+        x += step
+    return xs
+
+
+def _clipped_xyxy(x1, y1, x2, y2, cw, ch, gx0, gy0, W, H, edge=_SEAM_EDGE):
+    """xyxy variant of prod's _clipped_at_seam: True if a CROP-LOCAL box touches
+    an INNER tile edge (a partial booth the neighbouring tile holds whole). Boxes
+    flush against the real image border are kept."""
+    if x1 <= edge and gx0 > 0:
+        return True
+    if x2 >= cw - edge and gx0 + cw < W:
+        return True
+    if y1 <= edge and gy0 > 0:
+        return True
+    if y2 >= ch - edge and gy0 + ch < H:
+        return True
+    return False
+
+
+def _detect_on_crop(crop_bgr, bands, device, args, want_mask=True):
+    """Colour-mask + connected-components on ONE BGR crop (or the whole image).
+
+    Returns (boxes_xyxy, mask_np_u8, mask_ms, cc_ms):
+      boxes_xyxy : list of [x1,y1,x2,y2] in CROP-LOCAL pixel coords
+      mask_np_u8 : binary mask (uint8 0/255) for preview stitching, or None
+      mask_ms    : colour-mask+morphology wall time (CUDA-synced), ms
+      cc_ms      : connected-components wall time (CUDA-synced), ms
+    """
+    import cv2
+    # colour mask + morphology (GPU), per band, OR'd
+    _sync(); t0 = time.perf_counter()
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    hsv_t = image_to_tensor(hsv, device=device)
+    mask = None
+    for lo, hi in bands:
+        m = color_mask_pipeline_gpu(hsv_t, lo, hi,
+                                    open_ksize=args.open_ksize,
+                                    close_ksize=args.close_ksize)
+        mask = m if mask is None else (mask | m)
+    _sync(); mask_ms = (time.perf_counter() - t0) * 1e3
+
+    # connected components -> tile-local xyxy boxes
+    _sync(); t1 = time.perf_counter()
+    if args.cc == "cpu":
+        mask_cpu = (mask[0, 0].cpu().numpy() * 255).astype(np.uint8)
+        boxes = cpu_ref.components_boxes_cpu(mask_cpu, min_area=args.min_area).tolist()
+    else:
+        boxes_t = components_boxes_gpu(mask[0, 0], min_area=args.min_area,
+                                       max_iters=args.max_iters)
+        boxes = boxes_t.cpu().tolist()
+        mask_cpu = None
+    _sync(); cc_ms = (time.perf_counter() - t1) * 1e3
+
+    mask_np = None
+    if want_mask:
+        mask_np = mask_cpu if mask_cpu is not None else \
+            (mask[0, 0].cpu().numpy() * 255).astype(np.uint8)
+    return boxes, mask_np, mask_ms, cc_ms
+
+
+# --------------------------------------------------------------------------- #
 class Profiler:
     """Tiny step timer. Each .step() closes the previous step (with a CUDA sync
     so GPU work is actually finished before we read the clock) and prints it."""
@@ -172,7 +260,7 @@ def run(args):
                          interpolation=cv2.INTER_AREA)
     H, W = img.shape[:2]
 
-    # 3. choose colour band(s)
+    # 3. choose colour band(s) ONCE on the full image (reused for every tile)
     prof.step("colour band selection")
     if args.hsv_lower and args.hsv_upper:
         lo = [int(x) for x in args.hsv_lower.split(",")]
@@ -186,41 +274,57 @@ def run(args):
             print("   try a forced band, e.g. --hsv-lower 0,0,0 --hsv-upper 179,255,120")
             return
 
-    # 4. BGR -> HSV -> GPU tensor (host->device upload)
-    prof.step("to HSV + upload to GPU")
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    hsv_t = image_to_tensor(hsv, device=device)
+    # 4. detect — tiled dense pass (default), or single full-image pass (--tile 0)
+    use_tiling = bool(args.tile) and args.tile > 0 and max(H, W) > args.tile
+    mask_ms_tot = cc_ms_tot = 0.0
+    mask_full = None
+    total = 0
 
-    # 5. colour mask + morphology (per band, OR'd)
-    prof.step("color mask + morphology (GPU)")
-    mask = None
-    for lo, hi in bands:
-        m = color_mask_pipeline_gpu(hsv_t, lo, hi,
-                                    open_ksize=args.open_ksize,
-                                    close_ksize=args.close_ksize)
-        mask = m if mask is None else (mask | m)
-
-    # 6. connected components -> boxes
-    if args.cc == "cpu":
-        prof.step("connected components (CPU cv2)")
-        mask_np = (mask[0, 0].cpu().numpy() * 255).astype(np.uint8)
-        boxes = cpu_ref.components_boxes_cpu(mask_np, min_area=args.min_area).tolist()
+    if use_tiling:
+        step = max(1, args.tile - args.overlap)
+        xs = _tile_origins(W, args.tile, step)
+        ys = _tile_origins(H, args.tile, step)
+        total = len(xs) * len(ys)
+        print(f"  tiling: {len(xs)}x{len(ys)} = {total} tiles "
+              f"(tile={args.tile}, overlap={args.overlap}, step={step})")
+        prof.step(f"tiled detect: mask+CC over {total} tiles")
+        mask_full = np.zeros((H, W), dtype=np.uint8)
+        pool = []
+        n_raw = 0
+        for gy0 in ys:
+            for gx0 in xs:
+                y2c, x2c = min(gy0 + args.tile, H), min(gx0 + args.tile, W)
+                crop = img[gy0:y2c, gx0:x2c]
+                ch, cw = crop.shape[:2]
+                boxes, mnp, m_ms, c_ms = _detect_on_crop(crop, bands, device, args)
+                mask_ms_tot += m_ms; cc_ms_tot += c_ms
+                if mnp is not None:                      # stitch (overlap -> max)
+                    sub = mask_full[gy0:y2c, gx0:x2c]
+                    np.maximum(sub, mnp, out=sub)
+                n_raw += len(boxes)
+                for bx1, by1, bx2, by2 in boxes:
+                    if _clipped_xyxy(bx1, by1, bx2, by2, cw, ch, gx0, gy0, W, H,
+                                     edge=args.seam_edge):
+                        continue                         # neighbour tile holds it whole
+                    pool.append({"bbox": [float(bx1 + gx0), float(by1 + gy0),
+                                          float(bx2 + gx0), float(by2 + gy0)],
+                                 "score": 1.0})
+        print(f"  tiles: {n_raw} raw boxes across tiles -> {len(pool)} after seam-clip")
     else:
-        prof.step("connected components / label-prop (GPU)")
-        boxes_t = components_boxes_gpu(mask[0, 0], min_area=args.min_area,
-                                       max_iters=args.max_iters)
-        boxes = boxes_t.cpu().tolist()
+        prof.step("color mask + CC (single full-image pass)")
+        boxes, mask_full, m_ms, c_ms = _detect_on_crop(img, bands, device, args)
+        mask_ms_tot += m_ms; cc_ms_tot += c_ms
+        pool = [{"bbox": [float(v) for v in b], "score": 1.0} for b in boxes]
 
-    # 7. build pool
-    prof.step("build pool")
-    pool = [{"bbox": [float(x) for x in b], "score": 1.0} for b in boxes]
+    raw_count = len(pool)
 
-    # 8. merge / dedup
+    # 5. merge / dedup (GPU) — fuses the overlap-band duplicates from neighbouring
+    #    tiles plus any nested fragments, exactly as the prod global NMS does.
     prof.step(f"merge / dedup ({args.merge}, GPU)")
     merge_fn = nms_gpu_assisted if args.merge == "assisted" else nms_gpu_cluster
     kept = merge_fn(pool, args.iou, args.containment, device=device)
 
-    # 9. annotate + save
+    # 6. annotate + save
     prof.step("annotate + save PNGs")
     os.makedirs(args.outdir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(args.input))[0]
@@ -230,13 +334,14 @@ def run(args):
         cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
     boxes_png = os.path.join(args.outdir, f"{stem}_boxes.png")
     mask_png = os.path.join(args.outdir, f"{stem}_mask.png")
-    mask_img = (mask[0, 0].cpu().numpy() * 255).astype(np.uint8)
+    mask_img = mask_full if mask_full is not None else np.zeros((H, W), np.uint8)
     # Saving a full 38MP PNG is slow; downscale the previews so the save stage
     # doesn't dominate the timing (boxes are still placed at full-res accuracy).
     if args.preview_max and max(H, W) > args.preview_max:
         sc = args.preview_max / max(H, W)
         vis = cv2.resize(vis, (int(W * sc), int(H * sc)), interpolation=cv2.INTER_AREA)
-        mask_img = cv2.resize(mask_img, (int(W * sc), int(H * sc)), interpolation=cv2.INTER_NEAREST)
+        mask_img = cv2.resize(mask_img, (int(W * sc), int(H * sc)),
+                              interpolation=cv2.INTER_NEAREST)
     cv2.imwrite(boxes_png, vis)
     cv2.imwrite(mask_png, mask_img)
     prof.done()
@@ -249,9 +354,14 @@ def run(args):
         print(f"colour: auto-detected {len(bands)} hue band(s):")
         for lo, hi in bands:
             print(f"          HSV {lo} .. {hi}")
-    print(f"components: {len(boxes)} raw boxes   ->   merge ({args.merge}): {len(kept)} kept")
+    mode = f"tiled ({total} tiles)" if use_tiling else "single full-image pass"
+    print(f"detect mode: {mode}")
+    print(f"components: {raw_count} pooled boxes   ->   merge ({args.merge}): {len(kept)} kept")
     print("\n=== where the time went ===")
     prof.summary()
+    print("\n=== detect-stage breakdown (summed over tiles) ===")
+    print(f"  [{mask_ms_tot:8.1f} ms]  colour mask + morphology (GPU)")
+    print(f"  [{cc_ms_tot:8.1f} ms]  connected components (backend={args.cc})")
     print(f"\nsaved: {boxes_png}")
     print(f"saved: {mask_png}")
     return boxes_png, mask_png
@@ -263,6 +373,12 @@ def main():
     ap.add_argument("--page", type=int, default=0, help="PDF page index (0-based)")
     ap.add_argument("--dpi", type=int, default=200, help="PDF rasterisation DPI")
     ap.add_argument("--downscale", type=float, default=1.0, help="resize factor (<1 speeds up label-prop CC)")
+    ap.add_argument("--tile", type=int, default=1800,
+                    help="tile size in px for the dense pass (0 = single full-image pass)")
+    ap.add_argument("--overlap", type=int, default=400,
+                    help="overlap between adjacent tiles in px (a booth in the seam is held by the neighbour)")
+    ap.add_argument("--seam-edge", type=int, default=4,
+                    help="drop boxes within this many px of an INNER tile seam (neighbour holds them whole)")
     ap.add_argument("--colors", type=int, default=3, help="how many dominant hue bands to auto-detect")
     ap.add_argument("--hsv-lower", default=None, help="force one HSV lower bound 'H,S,V' (0..179,0..255,0..255)")
     ap.add_argument("--hsv-upper", default=None, help="force one HSV upper bound 'H,S,V'")
