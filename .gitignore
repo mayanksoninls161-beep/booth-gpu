@@ -7,3 +7,6 @@ __pycache__/
 fixtures/plan_synth.npy
 fixtures/plan_synth.png
 fixtures/boxes_pool_real.json
+
+# run_real.py annotated previews
+out/
