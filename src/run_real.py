@@ -164,17 +164,24 @@ def _clipped_xyxy(x1, y1, x2, y2, cw, ch, gx0, gy0, W, H, edge=_SEAM_EDGE):
     return False
 
 
-def _detect_on_crop(crop_bgr, bands, device, args, want_mask=True):
-    """Colour-mask + connected-components on ONE BGR crop (or the whole image).
+def _area_cap(boxes, cw, ch, max_area_frac):
+    """Drop boxes bigger than max_area_frac of the tile. The bordered pass's
+    inter-booth background (aisles) is one giant 'cell' that must be discarded;
+    real dense booths are only a tiny fraction of a tile."""
+    if not max_area_frac or max_area_frac <= 0:
+        return boxes
+    cap = float(max_area_frac) * float(cw) * float(ch)
+    return [b for b in boxes if (b[2] - b[0]) * (b[3] - b[1]) <= cap]
 
-    Returns (boxes_xyxy, mask_np_u8, mask_ms, cc_ms):
-      boxes_xyxy : list of [x1,y1,x2,y2] in CROP-LOCAL pixel coords
-      mask_np_u8 : binary mask (uint8 0/255) for preview stitching, or None
-      mask_ms    : colour-mask+morphology wall time (CUDA-synced), ms
-      cc_ms      : connected-components wall time (CUDA-synced), ms
-    """
+
+def _color_boxes(crop_bgr, bands, device, args):
+    """HSV colour-band mask -> morphology -> components (GPU, or cv2 via --cc cpu).
+
+    Keys on the fill COLOUR, so it owns the big colour-filled halls -- but it fuses
+    same-colour neighbours whenever --close-ksize bridges the thin separator line
+    between them, and it misses pale / low-saturation / white cells entirely.
+    Returns (boxes_xyxy, mask_u8, mask_ms, cc_ms)."""
     import cv2
-    # colour mask + morphology (GPU), per band, OR'd
     _sync(); t0 = time.perf_counter()
     hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
     hsv_t = image_to_tensor(hsv, device=device)
@@ -186,23 +193,71 @@ def _detect_on_crop(crop_bgr, bands, device, args, want_mask=True):
         mask = m if mask is None else (mask | m)
     _sync(); mask_ms = (time.perf_counter() - t0) * 1e3
 
-    # connected components -> tile-local xyxy boxes
     _sync(); t1 = time.perf_counter()
     if args.cc == "cpu":
-        mask_cpu = (mask[0, 0].cpu().numpy() * 255).astype(np.uint8)
-        boxes = cpu_ref.components_boxes_cpu(mask_cpu, min_area=args.min_area).tolist()
+        boxes = cpu_ref.components_boxes_cpu(
+            (mask[0, 0].cpu().numpy() * 255).astype(np.uint8),
+            min_area=args.min_area).tolist()
     else:
-        boxes_t = components_boxes_gpu(mask[0, 0], min_area=args.min_area,
-                                       max_iters=args.max_iters)
-        boxes = boxes_t.cpu().tolist()
-        mask_cpu = None
+        boxes = components_boxes_gpu(mask[0, 0], min_area=args.min_area,
+                                     max_iters=args.max_iters).cpu().tolist()
     _sync(); cc_ms = (time.perf_counter() - t1) * 1e3
+    mnp = (mask[0, 0].cpu().numpy() * 255).astype(np.uint8)
+    return boxes, mnp, mask_ms, cc_ms
 
-    mask_np = None
-    if want_mask:
-        mask_np = mask_cpu if mask_cpu is not None else \
-            (mask[0, 0].cpu().numpy() * 255).astype(np.uint8)
-    return boxes, mask_np, mask_ms, cc_ms
+
+def _bordered_boxes(crop_bgr, args):
+    """Border-keyed cell detection: the cells are the regions ENCLOSED by the dark
+    grid lines, so EVERY booth -- pale, white, or coloured -- is found, and two
+    touching booths stay separate because the dark line between them is background.
+
+    cv2 components are used here (NOT the GPU label-prop): the inverted mask's
+    inter-booth background is one giant component whose pixel-diameter is far past
+    `max_iters`, so label-prop would truncate and mislabel; a single cv2 scan is
+    both correct and size-independent.  Returns (boxes_xyxy, line_mask_u8, ...)."""
+    import cv2
+    _sync(); t0 = time.perf_counter()
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    lines = (gray < args.line_thresh).astype(np.uint8)        # borders + text
+    if args.seal_ksize and args.seal_ksize > 1:
+        k = cv2.getStructuringElement(cv2.MORPH_RECT,
+                                      (args.seal_ksize, args.seal_ksize))
+        lines = cv2.dilate(lines, k)                          # seal 1px gaps
+    cells = ((lines == 0).astype(np.uint8)) * 255             # between the lines
+    mask_ms = (time.perf_counter() - t0) * 1e3
+
+    t1 = time.perf_counter()
+    boxes = cpu_ref.components_boxes_cpu(cells, min_area=args.min_area).tolist()
+    cc_ms = (time.perf_counter() - t1) * 1e3
+    return boxes, lines * 255, mask_ms, cc_ms
+
+
+def _detect_on_crop(crop_bgr, bands, device, args, want_mask=True):
+    """Run the chosen detector(s) on ONE BGR crop (or the whole image).
+
+      --mode color    : HSV colour fills only      (owns big colour-filled halls)
+      --mode bordered : grid-line cells only        (owns dense / pale / white booths)
+      --mode both      : pool both; the global merge's merged-block pre-filter then
+                         drops any coarse colour blob that fine bordered cells tile.
+
+    Returns (boxes_xyxy, preview_mask_u8, mask_ms, cc_ms); boxes are CROP-LOCAL.
+    --max-area-frac caps the bordered background only (colour halls stay whole)."""
+    ch, cw = crop_bgr.shape[:2]
+    modes = ("color", "bordered") if args.mode == "both" else (args.mode,)
+    boxes = []
+    mask_ms = cc_ms = 0.0
+    color_prev = line_prev = None
+    for md in modes:
+        if md == "color":
+            bxs, color_prev, m_ms, c_ms = _color_boxes(crop_bgr, bands, device, args)
+        else:
+            bxs, line_prev, m_ms, c_ms = _bordered_boxes(crop_bgr, args)
+            bxs = _area_cap(bxs, cw, ch, args.max_area_frac)
+        mask_ms += m_ms; cc_ms += c_ms
+        boxes.extend(bxs)
+    # the line mask is the more telling preview for dense grids; fall back to colour
+    preview = line_prev if line_prev is not None else color_prev
+    return boxes, preview, mask_ms, cc_ms
 
 
 # --------------------------------------------------------------------------- #
@@ -354,8 +409,8 @@ def run(args):
         print(f"colour: auto-detected {len(bands)} hue band(s):")
         for lo, hi in bands:
             print(f"          HSV {lo} .. {hi}")
-    mode = f"tiled ({total} tiles)" if use_tiling else "single full-image pass"
-    print(f"detect mode: {mode}")
+    tiling_desc = f"tiled ({total} tiles)" if use_tiling else "single full-image pass"
+    print(f"detector: {args.mode}   |   {tiling_desc}")
     print(f"components: {raw_count} pooled boxes   ->   merge ({args.merge}): {len(kept)} kept")
     print("\n=== where the time went ===")
     prof.summary()
@@ -379,18 +434,29 @@ def main():
                     help="overlap between adjacent tiles in px (a booth in the seam is held by the neighbour)")
     ap.add_argument("--seam-edge", type=int, default=4,
                     help="drop boxes within this many px of an INNER tile seam (neighbour holds them whole)")
+    ap.add_argument("--mode", choices=["color", "bordered", "both"], default="both",
+                    help="detector: colour fills, grid-line cells, or both pooled (default)")
+    ap.add_argument("--line-thresh", type=int, default=128,
+                    help="[bordered] pixels darker than this are grid lines/borders (0..255)")
+    ap.add_argument("--seal-ksize", type=int, default=3,
+                    help="[bordered] dilate the line mask by this to seal 1px gaps in borders")
+    ap.add_argument("--max-area-frac", type=float, default=0.15,
+                    help="[bordered] drop cells bigger than this fraction of a tile (the inter-booth background)")
     ap.add_argument("--colors", type=int, default=3, help="how many dominant hue bands to auto-detect")
     ap.add_argument("--hsv-lower", default=None, help="force one HSV lower bound 'H,S,V' (0..179,0..255,0..255)")
     ap.add_argument("--hsv-upper", default=None, help="force one HSV upper bound 'H,S,V'")
     ap.add_argument("--min-area", type=int, default=300, help="drop components smaller than this (px^2)")
     ap.add_argument("--cc", choices=["gpu", "cpu"], default="gpu",
-                    help="connected-components backend: gpu label-prop, or cpu cv2 (faster on big images)")
+                    help="colour-pass components backend: gpu label-prop, or cpu cv2 (bordered always uses cv2)")
     ap.add_argument("--max-iters", type=int, default=256, help="label-prop rounds cap (raise for big cells)")
     ap.add_argument("--preview-max", type=int, default=2400,
                     help="longest side of saved preview PNGs (0 = full res); keeps save fast")
     ap.add_argument("--open-ksize", type=int, default=3)
-    ap.add_argument("--close-ksize", type=int, default=3)
-    ap.add_argument("--merge", choices=["cluster", "assisted"], default="cluster")
+    ap.add_argument("--close-ksize", type=int, default=1,
+                    help="colour-mask close kernel; keep at 1 so it does NOT bridge thin booth separators")
+    ap.add_argument("--merge", choices=["cluster", "assisted"], default="assisted",
+                    help="assisted = exact greedy NMS (merged-block pre-filter drops coarse fused blobs); "
+                         "cluster = aggressive connected-component grouping")
     ap.add_argument("--iou", type=float, default=0.3)
     ap.add_argument("--containment", type=float, default=0.7)
     ap.add_argument("--outdir", default="out")
