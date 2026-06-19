@@ -69,12 +69,23 @@ def test_cluster_nms_reasonable():
     pool, n_true = make_box_pool(n_cells=400, seed=3)
     cpu_keep = cpu_ref.non_max_suppression(pool, 0.3, 0.7)
     clu_keep = nms_gpu_cluster(pool, 0.3, 0.7, device=DEVICE)
-    # cluster collapses each overlap component to one box: count should be in a
-    # sane band around the true-cell count, and not wildly off the CPU result.
+    # Cluster collapses each connected overlap component to one representative,
+    # picking the SAME winner as the production sort (highest score, then largest
+    # area, then lowest index). With the merged-block pre-filter on, it no longer
+    # bridges several real cells into one giant blob, so it agrees with greedy NMS
+    # on the vast majority of boxes. It is NOT identical, by design: a transitive
+    # chain A-B-C collapses to one box where greedy can keep both ends, so a
+    # handful of disagreements is expected and correct -> gate at 0.8, not 1.0.
     assert 0 < len(clu_keep) <= len(pool)
     inter = len(_ids(cpu_keep) & _ids(clu_keep))
     agree = inter / max(1, len(_ids(cpu_keep) | _ids(clu_keep)))
-    assert agree >= 0.5, f"cluster agreement too low: {agree:.2f}"
+    assert agree >= 0.8, f"cluster agreement too low: {agree:.2f} (expected >=0.8)"
+    # Kept count must also be in a sane band of the CPU result (not wildly over-
+    # or under-merging). Cluster is a touch more aggressive, so allow ~15%.
+    assert len(clu_keep) <= len(cpu_keep) * 1.05, (
+        f"cluster kept too many: {len(clu_keep)} vs cpu {len(cpu_keep)}")
+    assert len(clu_keep) >= len(cpu_keep) * 0.85, (
+        f"cluster over-merged: {len(clu_keep)} vs cpu {len(cpu_keep)}")
     print(f"  [ok] cluster NMS sane (kept {len(clu_keep)} vs cpu {len(cpu_keep)}, "
           f"agree {agree*100:.0f}%, true~{n_true})")
 

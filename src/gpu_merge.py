@@ -82,6 +82,26 @@ def iou_ios_matrix_gpu(boxes_t):
     return iou, ios
 
 
+def merged_block_keep_mask(ios_t, bt, dtype=torch.float64):
+    """Vectorised merged-block pre-filter (the exact rule cpu_ref applies before
+    NMS). Returns a boolean [N] keep-mask: drop a big box that is tiled by >=2
+    strictly-smaller boxes which together cover >=75% of it, unless one of those
+    is a skinny text slice (the false-split guard)."""
+    w_t = (bt[:, 2] - bt[:, 0]).clamp(min=0)
+    h_t = (bt[:, 3] - bt[:, 1]).clamp(min=0)
+    areas_t = w_t * h_t
+    smaller = areas_t[:, None] < areas_t[None, :]          # [N,N] s smaller than b
+    cover = (ios_t > 0.80) & smaller                       # [N,N]
+    n_inside = cover.sum(dim=0)                            # [N] per big box b
+    covered = (cover.to(dtype) * (ios_t * areas_t[:, None])).sum(dim=0)  # [N]
+    long_side = torch.maximum(w_t, h_t)
+    short_side = torch.minimum(w_t, h_t).clamp(min=1.0)
+    skinny = ((long_side / short_side) > 2.5) & (areas_t < 15000)        # [N]
+    false_split = (cover & skinny[:, None]).any(dim=0)     # [N] per big box b
+    drop = (n_inside >= 2) & (covered >= 0.75 * areas_t) & (~false_split)
+    return ~drop
+
+
 # --------------------------------------------------------------------------- #
 # Pure-GPU clustering merge (fast path, O(log N))
 # --------------------------------------------------------------------------- #
@@ -108,31 +128,50 @@ def connected_components_matrix(adj):
 
 
 def pick_representatives(comp, scores, areas):
-    """One winner per component: highest score, then largest area, then lowest
-    index on an exact tie. Returns a 1-D tensor of kept box indices."""
+    """One winner per component, matching the production sort EXACTLY: highest
+    score, then largest area, then lowest index on a true tie.
+
+    A single packed key (score*BIG + area) does NOT work: score in [0,1] and area
+    can be the same order of magnitude, so a big low-score box would outrank a
+    small high-score box. We instead do a genuine lexicographic argmax in three
+    masked scatter-reductions: max score -> among those max area -> among those
+    min index. Returns a 1-D tensor of kept box indices.
+    """
     uniq, inv = torch.unique(comp, return_inverse=True)      # inv in [0,C)
     C = uniq.numel()
     N = comp.shape[0]
-    amax = areas.max() if N > 0 else torch.tensor(0.0, device=comp.device)
-    key = scores.to(torch.float64) * (amax.to(torch.float64) + 1.0) + areas.to(torch.float64)
+    sc = scores.to(torch.float64)
+    ar = areas.to(torch.float64)
+    neg = float("-inf")
 
-    best = torch.full((C,), float("-inf"), device=comp.device, dtype=torch.float64)
-    best.scatter_reduce_(0, inv, key, reduce="amax", include_self=True)
-    is_best = key >= best[inv]
+    # pass 1: max score per component
+    best_s = torch.full((C,), neg, device=comp.device, dtype=torch.float64)
+    best_s.scatter_reduce_(0, inv, sc, reduce="amax", include_self=True)
+    top_s = sc >= best_s[inv]                                # boxes at the group max score
 
+    # pass 2: among top-score boxes, max area
+    ar_masked = torch.where(top_s, ar, torch.full_like(ar, neg))
+    best_a = torch.full((C,), neg, device=comp.device, dtype=torch.float64)
+    best_a.scatter_reduce_(0, inv, ar_masked, reduce="amax", include_self=True)
+    top = top_s & (ar >= best_a[inv])
+
+    # pass 3: among those, lowest original index
     idx = torch.arange(N, device=comp.device)
-    cand = torch.where(is_best, idx, torch.full_like(idx, N))
+    cand = torch.where(top, idx, torch.full_like(idx, N))
     rep = torch.full((C,), N, device=comp.device, dtype=idx.dtype)
     rep.scatter_reduce_(0, inv, cand, reduce="amin", include_self=True)
     return rep
 
 
 def nms_gpu_cluster(boxes, iou_threshold=0.3, containment_threshold=0.7,
-                    device=None, dtype=torch.float32):
+                    device=None, dtype=torch.float32, prefilter=True):
     """Pure-GPU merge: collapse each overlap-graph component to its best box.
 
-    Fastest path; slightly more aggressive than greedy NMS. Returns the kept
-    boxes (same dict objects, original order preserved).
+    Fastest path. Still slightly more aggressive than greedy NMS (a chain of
+    overlaps becomes ONE box where greedy might keep both ends), so it is the
+    "fast/approximate" option. With `prefilter=True` it first drops merged-block
+    boxes (same rule as production) so a big block can't bridge several real cells
+    into one giant component. Returns the kept boxes (same dict objects).
     """
     if not boxes:
         return []
@@ -141,13 +180,27 @@ def nms_gpu_cluster(boxes, iou_threshold=0.3, containment_threshold=0.7,
     bt, scores = boxes_to_tensor(boxes, device=device, dtype=dtype)
     iou, ios = iou_ios_matrix_gpu(bt)
     N = bt.shape[0]
-    eye = torch.eye(N, device=device, dtype=torch.bool)
-    adj = (iou > iou_threshold) | (ios > containment_threshold) | eye
+
+    if prefilter:
+        keep_mask = merged_block_keep_mask(ios, bt, dtype=torch.float64)
+        sub = keep_mask.nonzero(as_tuple=True)[0]           # surviving indices
+    else:
+        sub = torch.arange(N, device=device)
+
+    iou_s = iou.index_select(0, sub).index_select(1, sub)
+    ios_s = ios.index_select(0, sub).index_select(1, sub)
+    M = sub.shape[0]
+    eye = torch.eye(M, device=device, dtype=torch.bool)
+    adj = (iou_s > iou_threshold) | (ios_s > containment_threshold) | eye
     adj = adj | adj.t()
     comp = connected_components_matrix(adj)
-    areas = (bt[:, 2] - bt[:, 0]).clamp(min=0) * (bt[:, 3] - bt[:, 1]).clamp(min=0)
-    kept = pick_representatives(comp, scores, areas)
-    kept = torch.sort(kept).values.tolist()
+
+    bt_s = bt.index_select(0, sub)
+    scores_s = scores.index_select(0, sub)
+    areas_s = (bt_s[:, 2] - bt_s[:, 0]).clamp(min=0) * (bt_s[:, 3] - bt_s[:, 1]).clamp(min=0)
+    rep_local = pick_representatives(comp, scores_s, areas_s)   # indices into sub
+    kept_global = sub.index_select(0, rep_local)
+    kept = torch.sort(kept_global).values.tolist()
     return [boxes[i] for i in kept]
 
 
@@ -168,29 +221,14 @@ def nms_gpu_assisted(boxes, iou_threshold=0.3, containment_threshold=0.7,
         return []
     if device is None:
         device = default_device()
-    import numpy as np
 
     bt, scores_t = boxes_to_tensor(boxes, device=device, dtype=dtype)
     iou_t, ios_t = iou_ios_matrix_gpu(bt)
-    w_t = (bt[:, 2] - bt[:, 0]).clamp(min=0)
-    h_t = (bt[:, 3] - bt[:, 1]).clamp(min=0)
-    areas_t = w_t * h_t
+    areas_t = (bt[:, 2] - bt[:, 0]).clamp(min=0) * (bt[:, 3] - bt[:, 1]).clamp(min=0)
     N = bt.shape[0]
 
-    # --- merged-block pre-filter, VECTORISED on GPU (same decisions as cpu_ref) ---
-    # `cover[s,b]` == small box s is strictly smaller than big box b AND s is
-    # >=80% swallowed by b. Then drop b iff >=2 such s, they cover >=75% of b's
-    # area, and none of them is a skinny text slice.
-    smaller = areas_t[:, None] < areas_t[None, :]          # [N,N] s smaller than b
-    cover = (ios_t > 0.80) & smaller                       # [N,N]
-    n_inside = cover.sum(dim=0)                            # [N] per big box b
-    covered = (cover.to(dtype) * (ios_t * areas_t[:, None])).sum(dim=0)  # [N]
-    long_side = torch.maximum(w_t, h_t)
-    short_side = torch.minimum(w_t, h_t).clamp(min=1.0)
-    skinny = ((long_side / short_side) > 2.5) & (areas_t < 15000)        # [N]
-    false_split = (cover & skinny[:, None]).any(dim=0)     # [N] per big box b
-    drop = (n_inside >= 2) & (covered >= 0.75 * areas_t) & (~false_split)
-    valid_mask = (~drop).cpu().numpy()
+    # --- merged-block pre-filter (same rule + helper used by the cluster path) ---
+    valid_mask = merged_block_keep_mask(ios_t, bt, dtype=dtype).cpu().numpy()
 
     # One transfer back: the dense N x N matrices + per-box scalars.
     iou = iou_t.cpu().numpy()

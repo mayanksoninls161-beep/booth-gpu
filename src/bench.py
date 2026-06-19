@@ -220,26 +220,50 @@ def bench_image(device, args):
     from gpu_ops import image_to_tensor, color_mask_pipeline_gpu
     from gpu_components import components_boxes_gpu
 
-    # --- CPU ---
-    def cpu_fn():
-        m = cpu_ref.color_mask_cpu(img, lower, upper)
-        return cpu_ref.components_boxes_cpu(m, min_area=80)
-    cpu_dt, cpu_boxes = timeit(cpu_fn, iters=args.iters_cpu, warmup=0, cuda=False)
+    # Time the two sub-stages SEPARATELY. Stage 1 (color mask + morphology) is a
+    # handful of elementwise/pool kernels -> GPU wins easily. Stage 2 (connected
+    # components) is the honest weak spot: our label-propagation CCL is iteration-
+    # bound (O(component diameter) 3x3 max-pool rounds) so on a single small image
+    # it loses to cv2's serial-but-tight scan. Lumping them hides which is which.
 
-    # --- GPU ---
+    # --- CPU: mask, then components on that mask ---
+    cpu_mask_dt, cpu_mask = timeit(
+        lambda: cpu_ref.color_mask_cpu(img, lower, upper),
+        iters=args.iters_cpu, warmup=0, cuda=False)
+    cpu_cc_dt, cpu_boxes = timeit(
+        lambda: cpu_ref.components_boxes_cpu(cpu_mask, min_area=80),
+        iters=args.iters_cpu, warmup=0, cuda=False)
+
+    # --- GPU: mask, then components on that mask ---
     img_chw = image_to_tensor(img, device=device)
-
-    def gpu_fn():
-        mask = color_mask_pipeline_gpu(img_chw, lower, upper)
-        return components_boxes_gpu(mask[0, 0], min_area=80)
-    gpu_dt, gpu_boxes_t = timeit(gpu_fn, iters=args.iters_gpu, warmup=1, cuda=True)
+    gpu_mask_dt, gpu_mask = timeit(
+        lambda: color_mask_pipeline_gpu(img_chw, lower, upper),
+        iters=args.iters_gpu, warmup=1, cuda=True)
+    gpu_cc_dt, gpu_boxes_t = timeit(
+        lambda: components_boxes_gpu(gpu_mask[0, 0], min_area=80),
+        iters=args.iters_gpu, warmup=1, cuda=True)
     gpu_boxes = gpu_boxes_t.cpu().tolist()
 
+    cpu_dt = cpu_mask_dt + cpu_cc_dt
+    gpu_dt = gpu_mask_dt + gpu_cc_dt
     rate = _match_rate(cpu_boxes.tolist(), gpu_boxes, iou_min=0.9)
-    print(f"  CPU  inRange+morph+CC: {_fmt_ms(cpu_dt)}  -> {len(cpu_boxes)} boxes")
-    print(f"  GPU  mask+labelprop  : {_fmt_ms(gpu_dt)}  -> {len(gpu_boxes)} boxes  "
-          f"[{rate * 100:.1f}% match @IoU0.9]  speedup x{cpu_dt / max(gpu_dt, 1e-9):.1f}")
+
+    def _spd(c, g):
+        return f"x{c / max(g, 1e-9):.1f}"
+    print(f"  --- stage 1: color mask + morphology ---")
+    print(f"    CPU inRange+morph  : {_fmt_ms(cpu_mask_dt)}")
+    print(f"    GPU mask pipeline  : {_fmt_ms(gpu_mask_dt)}  speedup {_spd(cpu_mask_dt, gpu_mask_dt)}")
+    print(f"  --- stage 2: connected components ---")
+    print(f"    CPU connectedComp  : {_fmt_ms(cpu_cc_dt)}  -> {len(cpu_boxes)} boxes")
+    print(f"    GPU label-prop CCL : {_fmt_ms(gpu_cc_dt)}  -> {len(gpu_boxes)} boxes  "
+          f"speedup {_spd(cpu_cc_dt, gpu_cc_dt)}  (iteration-bound; see note)")
+    print(f"  --- combined ---")
+    print(f"    CPU total          : {_fmt_ms(cpu_dt)}")
+    print(f"    GPU total          : {_fmt_ms(gpu_dt)}  "
+          f"[{rate * 100:.1f}% match @IoU0.9]  speedup {_spd(cpu_dt, gpu_dt)}")
     return {"cpu_ms": cpu_dt * 1e3, "gpu_ms": gpu_dt * 1e3,
+            "cpu_mask_ms": cpu_mask_dt * 1e3, "gpu_mask_ms": gpu_mask_dt * 1e3,
+            "cpu_cc_ms": cpu_cc_dt * 1e3, "gpu_cc_ms": gpu_cc_dt * 1e3,
             "cpu_boxes": len(cpu_boxes), "gpu_boxes": len(gpu_boxes), "match": rate}
 
 
@@ -281,6 +305,11 @@ def main():
               f"(x{base / max(merge['cluster_ms'], 1e-9):.1f}, "
               f"{merge['cluster_agreement'] * 100:.0f}% agree)")
     if image:
+        print(f" mask   CPU {image['cpu_mask_ms']:.1f}ms | GPU {image['gpu_mask_ms']:.1f}ms "
+              f"(x{image['cpu_mask_ms'] / max(image['gpu_mask_ms'], 1e-9):.1f})  <- GPU win")
+        print(f" comps  CPU {image['cpu_cc_ms']:.1f}ms | GPU {image['gpu_cc_ms']:.1f}ms "
+              f"(x{image['cpu_cc_ms'] / max(image['gpu_cc_ms'], 1e-9):.1f})  "
+              f"<- label-prop is iteration-bound, not the pipeline bottleneck")
         print(f" image  CPU {image['cpu_ms']:.1f}ms | GPU {image['gpu_ms']:.1f}ms "
               f"(x{image['cpu_ms'] / max(image['gpu_ms'], 1e-9):.1f}, "
               f"{image['match'] * 100:.0f}% match)")
