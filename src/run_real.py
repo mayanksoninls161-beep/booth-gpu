@@ -175,7 +175,17 @@ def _area_cap(boxes, cw, ch, max_area_frac):
     return [b for b in boxes if (b[2] - b[0]) * (b[3] - b[1]) <= cap]
 
 
-def _color_boxes(crop_bgr, bands, device, args):
+def _eff_min_area(cw, ch, args):
+    """Effective component floor for a crop. Prod scales the bordered floor with
+    the rendered size (bordered_min_area_frac of the crop area) so a small booth
+    survives at any DPI; --min-area is a hard pixel floor underneath that."""
+    eff = int(args.min_area)
+    if args.min_area_frac and args.min_area_frac > 0:
+        eff = max(eff, int(round(args.min_area_frac * cw * ch)))
+    return eff
+
+
+def _color_boxes(crop_bgr, bands, device, args, min_area):
     """HSV colour-band mask -> morphology -> components (GPU, or cv2 via --cc cpu).
 
     Keys on the fill COLOUR, so it owns the big colour-filled halls -- but it fuses
@@ -198,16 +208,16 @@ def _color_boxes(crop_bgr, bands, device, args):
     if args.cc == "cpu":
         boxes = cpu_ref.components_boxes_cpu(
             (mask[0, 0].cpu().numpy() * 255).astype(np.uint8),
-            min_area=args.min_area).tolist()
+            min_area=min_area).tolist()
     else:
-        boxes = components_boxes_gpu(mask[0, 0], min_area=args.min_area,
+        boxes = components_boxes_gpu(mask[0, 0], min_area=min_area,
                                      max_iters=args.max_iters).cpu().tolist()
     _sync(); cc_ms = (time.perf_counter() - t1) * 1e3
     mnp = (mask[0, 0].cpu().numpy() * 255).astype(np.uint8)
     return boxes, mnp, mask_ms, cc_ms
 
 
-def _bordered_boxes(crop_bgr, args):
+def _bordered_boxes(crop_bgr, args, min_area):
     """Border-keyed cell detection: the cells are the regions ENCLOSED by the dark
     grid lines, so EVERY booth -- pale, white, or coloured -- is found, and two
     touching booths stay separate because the dark line between them is background.
@@ -228,7 +238,7 @@ def _bordered_boxes(crop_bgr, args):
     mask_ms = (time.perf_counter() - t0) * 1e3
 
     t1 = time.perf_counter()
-    boxes = cpu_ref.components_boxes_cpu(cells, min_area=args.min_area).tolist()
+    boxes = cpu_ref.components_boxes_cpu(cells, min_area=min_area).tolist()
     cc_ms = (time.perf_counter() - t1) * 1e3
     return boxes, lines * 255, mask_ms, cc_ms
 
@@ -244,15 +254,16 @@ def _detect_on_crop(crop_bgr, bands, device, args, want_mask=True):
     Returns (boxes_xyxy, preview_mask_u8, mask_ms, cc_ms); boxes are CROP-LOCAL.
     --max-area-frac caps the bordered background only (colour halls stay whole)."""
     ch, cw = crop_bgr.shape[:2]
+    min_area = _eff_min_area(cw, ch, args)
     modes = ("color", "bordered") if args.mode == "both" else (args.mode,)
     boxes = []
     mask_ms = cc_ms = 0.0
     color_prev = line_prev = None
     for md in modes:
         if md == "color":
-            bxs, color_prev, m_ms, c_ms = _color_boxes(crop_bgr, bands, device, args)
+            bxs, color_prev, m_ms, c_ms = _color_boxes(crop_bgr, bands, device, args, min_area)
         else:
-            bxs, line_prev, m_ms, c_ms = _bordered_boxes(crop_bgr, args)
+            bxs, line_prev, m_ms, c_ms = _bordered_boxes(crop_bgr, args, min_area)
             bxs = _area_cap(bxs, cw, ch, args.max_area_frac)
         mask_ms += m_ms; cc_ms += c_ms
         boxes.extend(bxs)
@@ -462,7 +473,7 @@ def main():
     ap = argparse.ArgumentParser(description="Run the GPU booth pipeline on a real image/PDF")
     ap.add_argument("--input", required=True, help="path to an image (png/jpg) or .pdf")
     ap.add_argument("--page", type=int, default=0, help="PDF page index (0-based)")
-    ap.add_argument("--dpi", type=int, default=200, help="PDF rasterisation DPI")
+    ap.add_argument("--dpi", type=int, default=250, help="PDF rasterisation DPI (prod dense = 250)")
     ap.add_argument("--downscale", type=float, default=1.0, help="resize factor (<1 speeds up label-prop CC)")
     ap.add_argument("--tile", type=int, default=1800,
                     help="tile size in px for the dense pass (0 = single full-image pass)")
@@ -481,20 +492,23 @@ def main():
     ap.add_argument("--colors", type=int, default=3, help="how many dominant hue bands to auto-detect")
     ap.add_argument("--hsv-lower", default=None, help="force one HSV lower bound 'H,S,V' (0..179,0..255,0..255)")
     ap.add_argument("--hsv-upper", default=None, help="force one HSV upper bound 'H,S,V'")
-    ap.add_argument("--min-area", type=int, default=300, help="drop components smaller than this (px^2)")
+    ap.add_argument("--min-area", type=int, default=300, help="hard pixel floor: drop components smaller than this (px^2)")
+    ap.add_argument("--min-area-frac", type=float, default=0.0005,
+                    help="scaled floor (prod bordered_min_area_frac): drop components smaller than this "
+                         "fraction of the CROP area, so small booths survive at any DPI (0 = disable)")
     ap.add_argument("--cc", choices=["gpu", "cpu"], default="gpu",
                     help="colour-pass components backend: gpu label-prop, or cpu cv2 (bordered always uses cv2)")
     ap.add_argument("--max-iters", type=int, default=256, help="label-prop rounds cap (raise for big cells)")
     ap.add_argument("--preview-max", type=int, default=2400,
                     help="longest side of saved preview PNGs (0 = full res); keeps save fast")
     ap.add_argument("--open-ksize", type=int, default=3)
-    ap.add_argument("--close-ksize", type=int, default=1,
-                    help="colour-mask close kernel; keep at 1 so it does NOT bridge thin booth separators")
+    ap.add_argument("--close-ksize", type=int, default=3,
+                    help="colour-mask close kernel (prod dense = 3); lower to 1 if same-colour neighbours fuse")
     ap.add_argument("--merge", choices=["cluster", "assisted"], default="assisted",
                     help="assisted = exact greedy NMS (merged-block pre-filter drops coarse fused blobs); "
                          "cluster = aggressive connected-component grouping")
-    ap.add_argument("--iou", type=float, default=0.3)
-    ap.add_argument("--containment", type=float, default=0.7)
+    ap.add_argument("--iou", type=float, default=0.4, help="merge IoU suppression threshold (prod = 0.4)")
+    ap.add_argument("--containment", type=float, default=0.6, help="merge IoS containment threshold (prod = 0.6)")
     ap.add_argument("--outdir", default="out")
     args = ap.parse_args()
     run(args)
