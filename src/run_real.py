@@ -38,6 +38,7 @@ import torch
 from gpu_ops import image_to_tensor, color_mask_pipeline_gpu
 from gpu_components import components_boxes_gpu
 from gpu_merge import nms_gpu_cluster, nms_gpu_assisted
+import cpu_ref
 
 
 def _sync():
@@ -199,14 +200,19 @@ def run(args):
                                     close_ksize=args.close_ksize)
         mask = m if mask is None else (mask | m)
 
-    # 6. connected components -> boxes (the iteration-bound step)
-    prof.step("connected components / label-prop (GPU)")
-    boxes_t = components_boxes_gpu(mask[0, 0], min_area=args.min_area,
-                                   max_iters=args.max_iters)
+    # 6. connected components -> boxes
+    if args.cc == "cpu":
+        prof.step("connected components (CPU cv2)")
+        mask_np = (mask[0, 0].cpu().numpy() * 255).astype(np.uint8)
+        boxes = cpu_ref.components_boxes_cpu(mask_np, min_area=args.min_area).tolist()
+    else:
+        prof.step("connected components / label-prop (GPU)")
+        boxes_t = components_boxes_gpu(mask[0, 0], min_area=args.min_area,
+                                       max_iters=args.max_iters)
+        boxes = boxes_t.cpu().tolist()
 
-    # 7. device->host, build pool
-    prof.step("download boxes + build pool")
-    boxes = boxes_t.cpu().tolist()
+    # 7. build pool
+    prof.step("build pool")
     pool = [{"bbox": [float(x) for x in b], "score": 1.0} for b in boxes]
 
     # 8. merge / dedup
@@ -224,8 +230,15 @@ def run(args):
         cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
     boxes_png = os.path.join(args.outdir, f"{stem}_boxes.png")
     mask_png = os.path.join(args.outdir, f"{stem}_mask.png")
+    mask_img = (mask[0, 0].cpu().numpy() * 255).astype(np.uint8)
+    # Saving a full 38MP PNG is slow; downscale the previews so the save stage
+    # doesn't dominate the timing (boxes are still placed at full-res accuracy).
+    if args.preview_max and max(H, W) > args.preview_max:
+        sc = args.preview_max / max(H, W)
+        vis = cv2.resize(vis, (int(W * sc), int(H * sc)), interpolation=cv2.INTER_AREA)
+        mask_img = cv2.resize(mask_img, (int(W * sc), int(H * sc)), interpolation=cv2.INTER_NEAREST)
     cv2.imwrite(boxes_png, vis)
-    cv2.imwrite(mask_png, (mask[0, 0].cpu().numpy() * 255).astype(np.uint8))
+    cv2.imwrite(mask_png, mask_img)
     prof.done()
 
     # --- report ---
@@ -254,7 +267,11 @@ def main():
     ap.add_argument("--hsv-lower", default=None, help="force one HSV lower bound 'H,S,V' (0..179,0..255,0..255)")
     ap.add_argument("--hsv-upper", default=None, help="force one HSV upper bound 'H,S,V'")
     ap.add_argument("--min-area", type=int, default=300, help="drop components smaller than this (px^2)")
+    ap.add_argument("--cc", choices=["gpu", "cpu"], default="gpu",
+                    help="connected-components backend: gpu label-prop, or cpu cv2 (faster on big images)")
     ap.add_argument("--max-iters", type=int, default=256, help="label-prop rounds cap (raise for big cells)")
+    ap.add_argument("--preview-max", type=int, default=2400,
+                    help="longest side of saved preview PNGs (0 = full res); keeps save fast")
     ap.add_argument("--open-ksize", type=int, default=3)
     ap.add_argument("--close-ksize", type=int, default=3)
     ap.add_argument("--merge", choices=["cluster", "assisted"], default="cluster")

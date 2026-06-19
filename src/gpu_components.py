@@ -44,28 +44,51 @@ def _max_pool_neighbors(labels, connectivity=8, ksize=3):
     return out
 
 
-def label_components_gpu(mask, connectivity=8, max_iters=4096):
+def label_components_gpu(mask, connectivity=8, max_iters=4096, check_every=8):
     """Label a binary mask [H,W] or [1,1,H,W] on GPU.
 
     Returns an int64 label image [H,W] (0 = background, components numbered with
     arbitrary positive ids — not necessarily contiguous).
+
+    Two T4-critical optimisations vs the naive version:
+
+    * float32, not float64.  The propagation is a max_pool, and max of two ints
+      is EXACT in float32 as long as the labels stay below 2^24 (16.7M). On a
+      Tesla T4 FP64 runs at ~1/32 of FP32, so the old float64 path was paying a
+      ~32x tax for nothing. We seed labels by foreground RANK (1..n_fg) instead
+      of flat pixel index (1..H*W), so the largest label is the foreground-pixel
+      COUNT — which keeps us in float32 range for any plausible plan. We only
+      fall back to float64 if the foreground itself exceeds 16.7M pixels.
+
+    * fewer convergence checks.  torch.equal forces a GPU->CPU sync every round;
+      on a multi-hundred-round propagation that stalls the pipeline. We only test
+      for the fixed point every `check_every` rounds (a few extra cheap max_pool
+      rounds is far cheaper than a sync per round).
     """
     m = mask
     if m.ndim == 2:
         m = m.view(1, 1, *m.shape)
-    m = (m > 0).to(torch.float64)            # float so max_pool keeps big ints exactly
-    N, _, H, W = m.shape
+    fg_bool = (m > 0)
+    N, _, H, W = fg_bool.shape
     assert N == 1, "label_components_gpu handles one image at a time"
 
-    device = m.device
-    idx = torch.arange(1, H * W + 1, device=device, dtype=torch.float64).view(1, 1, H, W)
-    labels = m * idx                          # unique seed per fg pixel, 0 on bg
+    flat_fg = fg_bool.view(-1)
+    n_fg = int(flat_fg.sum().item())          # one sync, unavoidable
+    if n_fg == 0:
+        return torch.zeros((H, W), dtype=torch.int64, device=fg_bool.device)
+    dtype = torch.float32 if n_fg <= (1 << 24) else torch.float64
 
-    fg = m  # foreground gate
-    for _ in range(max_iters):
+    # rank seed: cumulative count of fg pixels gives 1..n_fg at fg positions
+    ranks = torch.cumsum(flat_fg.to(torch.int64), dim=0)
+    seed = (ranks * flat_fg.to(torch.int64)).to(dtype).view(1, 1, H, W)
+    fg = fg_bool.to(dtype)                     # foreground gate
+    labels = seed
+
+    for i in range(max_iters):
         prop = _max_pool_neighbors(labels, connectivity=connectivity, ksize=3)
         prop = prop * fg                      # never light up background
-        if torch.equal(prop, labels):
+        if i % check_every == check_every - 1 and torch.equal(prop, labels):
+            labels = prop
             break
         labels = prop
     return labels.view(H, W).to(torch.int64)
