@@ -51,6 +51,7 @@ from gpu_merge import nms_gpu_cluster, nms_gpu_assisted
 import cpu_ref
 import geometric
 import text_recover
+import roboflow_hall
 
 
 def _sync():
@@ -633,6 +634,21 @@ def run(args):
         if args.fp_policy == "strict":
             kept = [b for b in kept if b.get("text_status") == "boothlike"]
 
+    # 5f. Roboflow HALL model (the same model prod runs alongside booths), so the
+    #     GPU repo reproduces prod's hall + booth output for a full-pipeline
+    #     comparison. Off unless --roboflow-hall (needs ROBOFLOW_HALL_API_KEY +
+    #     the `inference` package + network).
+    halls = []
+    hall_booth_map = None
+    if args.roboflow_hall:
+        prof.step("roboflow hall model (infer + scale-back)")
+        try:
+            halls = roboflow_hall.detect_halls(img, conf=args.hall_conf,
+                                                max_edge=args.hall_max_edge)
+            hall_booth_map = roboflow_hall.build_hall_booth_map(halls, kept)
+        except Exception as e:  # noqa: BLE001
+            print(f"  !! roboflow hall pass failed ({e}); continuing without halls")
+
     # 6. annotate + save
     prof.step("annotate + save PNGs")
     os.makedirs(args.outdir, exist_ok=True)
@@ -641,6 +657,9 @@ def run(args):
     for b in kept:
         x1, y1, x2, y2 = (int(round(v)) for v in b["bbox"])
         cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    for hbox in halls:  # halls in magenta, thicker
+        cv2.rectangle(vis, (int(hbox["x1"]), int(hbox["y1"])),
+                      (int(hbox["x2"]), int(hbox["y2"])), (255, 0, 255), 6)
     boxes_png = os.path.join(args.outdir, f"{stem}_boxes.png")
     mask_png = os.path.join(args.outdir, f"{stem}_mask.png")
     mask_img = mask_full if mask_full is not None else np.zeros((H, W), np.uint8)
@@ -679,6 +698,22 @@ def run(args):
                               "seal_ksize": args.seal_ksize, "max_area_frac": args.max_area_frac,
                               "iou": args.iou, "containment": args.containment},
                    "count": len(recs), "boxes": recs}, f)
+
+    # Roboflow hall output (separate file; the hall->booth map mirrors prod's
+    # hall_with_booth_predict response). Only written when the hall pass ran.
+    hall_json_path = None
+    if args.roboflow_hall:
+        hall_json_path = os.path.join(args.outdir, f"{stem}_halls.json")
+        with open(hall_json_path, "w") as f:
+            json.dump({"input": os.path.basename(args.input),
+                       "model": "hall_detection/6",
+                       "n_halls": len(halls),
+                       "halls": [{k: h[k] for k in ("x1", "y1", "x2", "y2", "area",
+                                                     "confidence", "class")} for h in halls],
+                       "hall_booth_map": {
+                           hk: {"coordinates": hv.get("coordinates"),
+                                "n_booths": len(hv.get("booths", []))}
+                           for hk, hv in (hall_booth_map or {}).items()}}, f)
     prof.done()
 
     # --- report ---
@@ -704,6 +739,12 @@ def run(args):
         n_boothlike = sum(1 for r in recs if r["text_status"] == "boothlike")
         print(f"  text layer: {len(text_items)} spans   |   boothlike-labelled boxes: {n_boothlike}"
               f"   |   text-recovered: {n_recovered}")
+    if args.roboflow_hall:
+        if hall_booth_map is not None:
+            per_hall = {k: len(v.get("booths", [])) for k, v in hall_booth_map.items()}
+            print(f"  roboflow halls: {len(halls)} detected   |   booths/hall: {per_hall}")
+        else:
+            print("  roboflow halls: pass failed (see warning above)")
     if recs:
         a = np.array([r["area"] for r in recs])
         wv = np.array([r["w"] for r in recs])
@@ -726,6 +767,8 @@ def run(args):
     print(f"  [{cc_ms_tot:8.1f} ms]  connected components (backend={args.cc})")
     print(f"\nsaved: {boxes_png}")
     print(f"saved: {mask_png}")
+    if hall_json_path:
+        print(f"saved: {hall_json_path}")
     return boxes_png, mask_png
 
 
@@ -800,6 +843,14 @@ def main():
     ap.add_argument("--no-label", dest="label", action="store_false")
     ap.add_argument("--fp-policy", choices=["none", "strict"], default="strict",
                     help="strict keeps only text-labelled (boothlike) + shape-source booths (prod default)")
+    # --- Roboflow hall model (same model prod runs alongside booths) ---
+    ap.add_argument("--roboflow-hall", dest="roboflow_hall", action="store_true", default=False,
+                    help="run the Roboflow hall_detection/6 model (needs ROBOFLOW_HALL_API_KEY env "
+                         "+ the `inference` package + network) and build the hall->booth map, "
+                         "mirroring prod's hall_with_booth_predict for a full-pipeline comparison")
+    ap.add_argument("--hall-conf", type=float, default=0.4, help="[roboflow] hall confidence threshold")
+    ap.add_argument("--hall-max-edge", type=int, default=2048,
+                    help="[roboflow] downscale the render so its long edge <= this before infer (prod = 2048)")
     ap.add_argument("--outdir", default="out")
     args = ap.parse_args()
     run(args)
