@@ -491,6 +491,42 @@ class Profiler:
         print(f"  [{tot * 1e3:8.1f} ms] 100.0%  TOTAL (end to end)")
 
 
+# --- false-positive policy (port of prod app/adaptive/labeling.py) -----------
+# shape sources are trusted on their own geometry (no text required); the
+# geometric pass ("opencv_strict") is kept unless its cell is provably empty.
+POLICY_SHAPE_SOURCES = {"color", "bordered", "bigregion"}
+
+
+def resolve_adaptive(booths):
+    """Prod resolve_adaptive: go strict only when the text layer actually carries
+    booth numbers (>=15% boothlike, min 10), else fall back to shape so plans
+    whose booth IDs the RE_BOOTH regex can't match keep their geometry boxes."""
+    n = len(booths)
+    n_boothlike = sum(1 for b in booths if b.get("text_status") == "boothlike")
+    return "strict" if n_boothlike >= max(10, 0.15 * n) else "shape"
+
+
+def apply_fp_policy(booths, policy):
+    """Filter booths by the resolved policy (port of prod apply_policy)."""
+    if policy == "none":
+        return booths
+    if policy == "strict":
+        return [b for b in booths if b.get("text_status") == "boothlike"]
+    # shape: trust shape-source geometry; keep opencv_strict unless empty; any
+    # other source needs a boothlike label.
+    out = []
+    for b in booths:
+        src = b.get("source", "")
+        if src in POLICY_SHAPE_SOURCES:
+            out.append(b)
+        elif src == "opencv_strict":
+            if b.get("text_status", "empty") != "empty":
+                out.append(b)
+        elif b.get("text_status") == "boothlike":
+            out.append(b)
+    return out
+
+
 def run(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     import cv2
@@ -628,11 +664,19 @@ def run(args):
         text_recover.label_booths(kept, text_items)
         if args.text_recover:
             n_recovered = text_recover.recover_missing(kept, text_items)
-        # strict FP policy (prod POLICIES["strict"]): final output is ONLY the
-        # text-labelled (boothlike) booths -- this is what cuts the false
-        # positives down to the real booth count.
-        if args.fp_policy == "strict":
-            kept = [b for b in kept if b.get("text_status") == "boothlike"]
+        # FP policy (port of prod app/adaptive/labeling.py). "adaptive" is prod's
+        # real default: it inspects the boothlike ratio and only goes strict when
+        # the text layer actually carries booth numbers, otherwise it falls back
+        # to "shape" so non-text plans (e.g. pure-numeric booth IDs the RE_BOOTH
+        # regex can't match) keep their geometry boxes.
+        before = len(kept)
+        policy = args.fp_policy
+        if policy == "adaptive":
+            policy = resolve_adaptive(kept)
+            print(f"  fp-policy adaptive -> resolved '{policy}'")
+        kept = apply_fp_policy(kept, policy)
+        if policy != "none":
+            print(f"  fp-policy '{policy}': {before} -> {len(kept)} booths kept")
 
     # 5f. Roboflow HALL model (the same model prod runs alongside booths), so the
     #     GPU repo reproduces prod's hall + booth output for a full-pipeline
@@ -841,8 +885,11 @@ def main():
     ap.add_argument("--label", dest="label", action="store_true", default=True,
                     help="[PDF] attach the PDF text layer to each booth and tag it")
     ap.add_argument("--no-label", dest="label", action="store_false")
-    ap.add_argument("--fp-policy", choices=["none", "strict"], default="strict",
-                    help="strict keeps only text-labelled (boothlike) + shape-source booths (prod default)")
+    ap.add_argument("--fp-policy", choices=["none", "strict", "shape", "adaptive"],
+                    default="adaptive",
+                    help="adaptive (prod default): strict when >=15%% of booths are "
+                         "boothlike, else shape; strict=only boothlike; shape=trust "
+                         "shape-source geometry; none=keep everything")
     # --- Roboflow hall model (same model prod runs alongside booths) ---
     ap.add_argument("--roboflow-hall", dest="roboflow_hall", action="store_true", default=False,
                     help="run the Roboflow hall_detection/6 model (needs ROBOFLOW_HALL_API_KEY env "
