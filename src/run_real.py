@@ -41,6 +41,7 @@ import argparse
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -367,6 +368,55 @@ def drop_contained(booths, ios_thresh=0.6):
     return out
 
 
+def recover_uncovered_bordered(pool, kept, iou_thresh, ios_thresh):
+    """Re-instate bordered boxes that NMS suppressed but which cover a region NO
+    kept box occupies. Geometric now outscores bordered (1.0 vs 0.45), so a
+    geometric box overlapping a bordered cell wins -- correct for normal grids,
+    but it also wipes out micro-cell clusters (e.g. the SHOWCASE strip) and a few
+    dense cells that ONLY the bordered pass traces. Prod keeps these (its 372
+    bordered survivors sit where geometric didn't reach). This adds back any
+    bordered pool box that does not overlap (IoU) or nest inside (IoS) a kept box,
+    so it can only raise recall in genuinely empty regions -- never disturb the
+    already-matched booths. Returns (kept, n_recovered)."""
+    def iou(a, b):
+        ax1, ay1, ax2, ay2 = a["bbox"]; bx1, by1, bx2, by2 = b["bbox"]
+        ix = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+        iy = max(0.0, min(ay2, by2) - max(ay1, by1))
+        inter = ix * iy
+        u = _xyxy_area(a) + _xyxy_area(b) - inter
+        return inter / u if u > 0 else 0.0
+
+    def ios_self(a, b):  # fraction of a's OWN area inside b
+        ax1, ay1, ax2, ay2 = a["bbox"]; bx1, by1, bx2, by2 = b["bbox"]
+        ix = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+        iy = max(0.0, min(ay2, by2) - max(ay1, by1))
+        sa = _xyxy_area(a)
+        return (ix * iy) / sa if sa > 0 else 0.0
+
+    import collections
+    CELL = 400
+    grid = collections.defaultdict(list)
+    for k in kept:
+        x1, y1, x2, y2 = k["bbox"]
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        grid[(int(cx // CELL), int(cy // CELL))].append(k)
+    n_rec = 0
+    for b in pool:
+        if b.get("source") != "bordered":
+            continue
+        x1, y1, x2, y2 = b["bbox"]
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        gx, gy = int(cx // CELL), int(cy // CELL)
+        neigh = [o for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                 for o in grid.get((gx + dx, gy + dy), [])]
+        if any(iou(b, o) >= iou_thresh or ios_self(b, o) >= ios_thresh for o in neigh):
+            continue                       # region already covered by a kept box
+        kept.append(b)
+        grid[(gx, gy)].append(b)           # so two uncovered bordered don't double-add
+        n_rec += 1
+    return kept, n_rec
+
+
 def _distinct_label_cells(text_items, B, cell):
     x1, y1, x2, y2 = B["bbox"]
     cells = set()
@@ -594,32 +644,62 @@ def run(args):
         total = len(xs) * len(ys)
         print(f"  tiling: {len(xs)}x{len(ys)} = {total} tiles "
               f"(tile={args.tile}, overlap={args.overlap}, step={step})")
-        prof.step(f"tiled detect: mask+CC over {total} tiles")
+        # Tile concurrency: the per-tile detect is mostly CPU OpenCV work
+        # (geometric/bordered connected-components), so threads give REAL
+        # parallelism (OpenCV releases the GIL); the GPU colour mask is shared
+        # safely across threads on one CUDA context. The limit is CPU cores, not
+        # the GPU -- free Colab T4 boxes typically expose ~2 vCPUs, so the speedup
+        # there is ~1.5-2x; a many-core host scales much further. --workers caps it.
+        n_workers = max(1, args.workers if args.workers > 0
+                        else min(8, os.cpu_count() or 4))
+        if n_workers > 1:
+            try:
+                import cv2 as _cv2
+                _cv2.setNumThreads(1)   # avoid oversubscribing cores per tile
+            except Exception:
+                pass
+        prof.step(f"tiled detect: mask+CC over {total} tiles ({n_workers} workers)")
+        print(f"  tile concurrency: {n_workers} worker thread(s) "
+              f"(cpu_count={os.cpu_count()})")
         mask_full = np.zeros((H, W), dtype=np.uint8)
+        coords = [(gy0, gx0) for gy0 in ys for gx0 in xs]
+
+        def _work(origin):
+            gy0, gx0 = origin
+            y2c, x2c = min(gy0 + args.tile, H), min(gx0 + args.tile, W)
+            crop = img[gy0:y2c, gx0:x2c]
+            ch, cw = crop.shape[:2]
+            boxes, mnp, m_ms, c_ms = _detect_on_crop(crop, bands, device, args,
+                                                     geo_params=geo_params)
+            return gy0, gx0, y2c, x2c, ch, cw, boxes, mnp, m_ms, c_ms
+
         pool = []
         n_raw = 0
-        for gy0 in ys:
-            for gx0 in xs:
-                y2c, x2c = min(gy0 + args.tile, H), min(gx0 + args.tile, W)
-                crop = img[gy0:y2c, gx0:x2c]
-                ch, cw = crop.shape[:2]
-                boxes, mnp, m_ms, c_ms = _detect_on_crop(crop, bands, device, args,
-                                                         geo_params=geo_params)
-                mask_ms_tot += m_ms; cc_ms_tot += c_ms
-                if mnp is not None:                      # stitch (overlap -> max)
-                    sub = mask_full[gy0:y2c, gx0:x2c]
-                    np.maximum(sub, mnp, out=sub)
-                n_raw += len(boxes)
-                for sb in boxes:
-                    bx1, by1, bx2, by2 = sb["xyxy"]
-                    if _clipped_xyxy(bx1, by1, bx2, by2, cw, ch, gx0, gy0, W, H,
-                                     edge=args.seam_edge):
-                        continue                         # neighbour tile holds it whole
-                    rec = {"bbox": [bx1 + gx0, by1 + gy0, bx2 + gx0, by2 + gy0],
-                           "score": _source_score(sb["source"]), "source": sb["source"]}
-                    if sb.get("coords"):
-                        rec["coords"] = [[p[0] + gx0, p[1] + gy0] for p in sb["coords"]]
-                    pool.append(rec)
+        if n_workers > 1:
+            ex = ThreadPoolExecutor(max_workers=n_workers)
+            results = ex.map(_work, coords)
+        else:
+            results = (_work(o) for o in coords)
+        # Stitch + offset in the MAIN thread (sequential) so mask_full writes and
+        # pool appends are race-free, regardless of worker order.
+        for (gy0, gx0, y2c, x2c, ch, cw, boxes, mnp, m_ms, c_ms) in results:
+            mask_ms_tot += m_ms; cc_ms_tot += c_ms
+            if mnp is not None:                      # stitch (overlap -> max)
+                sub = mask_full[gy0:y2c, gx0:x2c]
+                np.maximum(sub, mnp, out=sub)
+            n_raw += len(boxes)
+            for sb in boxes:
+                bx1, by1, bx2, by2 = sb["xyxy"]
+                if _clipped_xyxy(bx1, by1, bx2, by2, cw, ch, gx0, gy0, W, H,
+                                 edge=args.seam_edge):
+                    continue                         # neighbour tile holds it whole
+                rec = {"bbox": [bx1 + gx0, by1 + gy0, bx2 + gx0, by2 + gy0],
+                       "score": _source_score(sb["source"]), "source": sb["source"]}
+                if sb.get("coords"):
+                    rec["coords"] = [[p[0] + gx0, p[1] + gy0] for p in sb["coords"]]
+                pool.append(rec)
+        if n_workers > 1:
+            ex.shutdown()
         print(f"  tiles: {n_raw} raw boxes across tiles -> {len(pool)} after seam-clip")
     else:
         prof.step("color mask + CC (single full-image pass)")
@@ -649,6 +729,14 @@ def run(args):
     # IoS containment drop (prod tiling._drop_contained): small box nested in a
     # bigger one survives IoU-NMS, so remove it here.
     kept = drop_contained(kept, args.containment)
+    # Recover bordered micro-cells (showcase strips, dense cells) that geometric
+    # outscored in NMS but which sit where NO kept box landed -- prod keeps these.
+    n_bordered_rec = 0
+    if args.recover_bordered:
+        kept, n_bordered_rec = recover_uncovered_bordered(
+            pool, kept, args.iou, args.containment)
+        if n_bordered_rec:
+            print(f"  recovered {n_bordered_rec} uncovered bordered micro-cells")
     for k in kept:
         k.setdefault("source", "color")
 
@@ -846,6 +934,16 @@ def main():
                     help="overlap between adjacent tiles in px (a booth in the seam is held by the neighbour)")
     ap.add_argument("--seam-edge", type=int, default=4,
                     help="drop boxes within this many px of an INNER tile seam (neighbour holds them whole)")
+    ap.add_argument("--no-recover-bordered", dest="recover_bordered",
+                    action="store_false", default=True,
+                    help="disable re-instating bordered micro-cells (showcase/dense "
+                         "cells) that geometric outscored in NMS but which cover an "
+                         "otherwise-empty region (prod keeps these)")
+    ap.add_argument("--workers", type=int, default=0,
+                    help="tile detect concurrency (thread pool). 0 = auto "
+                         "min(8, cpu_count). The bottleneck is CPU OpenCV CC, not "
+                         "the GPU, so the practical ceiling is the host's vCPU count "
+                         "(free Colab T4 ~2 cores -> ~1.5-2x; a many-core host scales further)")
     ap.add_argument("--mode", choices=["color", "bordered", "geometric", "both", "all"],
                     default="all",
                     help="detector: colour fills, grid-line cells, geometric line-extraction, "
