@@ -38,6 +38,7 @@ Nothing is uploaded anywhere; everything stays local to the Colab VM.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import time
 
@@ -399,6 +400,26 @@ def run(args):
                               interpolation=cv2.INTER_NEAREST)
     cv2.imwrite(boxes_png, vis)
     cv2.imwrite(mask_png, mask_img)
+
+    # full-resolution kept boxes as JSON, for offline verification of the result
+    # (the previews are downscaled; this is the exact, full-res truth).
+    recs = []
+    for b in kept:
+        x1, y1, x2, y2 = (float(v) for v in b["bbox"])
+        recs.append({"bbox": [x1, y1, x2, y2], "score": float(b.get("score", 1.0)),
+                     "w": x2 - x1, "h": y2 - y1, "area": (x2 - x1) * (y2 - y1)})
+    json_path = os.path.join(args.outdir, f"{stem}_boxes.json")
+    with open(json_path, "w") as f:
+        json.dump({"input": os.path.basename(args.input),
+                   "image": {"w": W, "h": H},
+                   "detector": args.mode,
+                   "tiling": (total if use_tiling else 0),
+                   "merge": args.merge,
+                   "params": {"tile": args.tile, "overlap": args.overlap,
+                              "min_area": args.min_area, "line_thresh": args.line_thresh,
+                              "seal_ksize": args.seal_ksize, "max_area_frac": args.max_area_frac,
+                              "iou": args.iou, "containment": args.containment},
+                   "count": len(recs), "boxes": recs}, f)
     prof.done()
 
     # --- report ---
@@ -412,6 +433,21 @@ def run(args):
     tiling_desc = f"tiled ({total} tiles)" if use_tiling else "single full-image pass"
     print(f"detector: {args.mode}   |   {tiling_desc}")
     print(f"components: {raw_count} pooled boxes   ->   merge ({args.merge}): {len(kept)} kept")
+    if recs:
+        a = np.array([r["area"] for r in recs])
+        wv = np.array([r["w"] for r in recs])
+        hv = np.array([r["h"] for r in recs])
+        qs = [0, 5, 25, 50, 75, 95, 100]
+        pct = lambda arr: {q: int(np.percentile(arr, q)) for q in qs}
+        print("\n=== kept-box size distribution (verify small booths survived) ===")
+        print(f"  area  pctl(px^2): {pct(a)}")
+        print(f"  width pctl(px)  : {pct(wv)}")
+        print(f"  height pctl(px) : {pct(hv)}")
+        edges = [0, 500, 1000, 2000, 4000, 8000, 1e18]
+        hist, _ = np.histogram(a, bins=edges)
+        labels = ["<500", "500-1k", "1k-2k", "2k-4k", "4k-8k", ">8k"]
+        print("  area histogram : " + "  ".join(f"{labels[i]}={int(hist[i])}" for i in range(len(hist))))
+    print(f"saved JSON: {json_path}")
     print("\n=== where the time went ===")
     prof.summary()
     print("\n=== detect-stage breakdown (summed over tiles) ===")
