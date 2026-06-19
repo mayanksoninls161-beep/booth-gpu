@@ -117,63 +117,105 @@ def auto_hsv_bands(img_bgr, k=3, s_min=60, v_min=60, hue_halfwidth=8):
 
 
 # --------------------------------------------------------------------------- #
+class Profiler:
+    """Tiny step timer. Each .step() closes the previous step (with a CUDA sync
+    so GPU work is actually finished before we read the clock) and prints it."""
+
+    def __init__(self):
+        self.rows = []
+        self._t = None
+        self._label = None
+
+    def step(self, label):
+        now = time.perf_counter()
+        if self._label is not None:
+            _sync()
+            now = time.perf_counter()
+            dt = now - self._t
+            self.rows.append((self._label, dt))
+            print(f"  [{dt * 1e3:8.1f} ms]  {self._label}")
+        self._label = label
+        self._t = time.perf_counter()
+
+    def done(self):
+        self.step(None)
+
+    def total(self):
+        return sum(dt for _, dt in self.rows)
+
+    def summary(self):
+        tot = self.total()
+        print("  " + "-" * 46)
+        for label, dt in self.rows:
+            pct = (dt / tot * 100) if tot else 0.0
+            print(f"  [{dt * 1e3:8.1f} ms] {pct:5.1f}%  {label}")
+        print(f"  [{tot * 1e3:8.1f} ms] 100.0%  TOTAL (end to end)")
+
+
 def run(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    img = load_image(args.input, dpi=args.dpi, page=args.page)
-    H, W = img.shape[:2]
-    if args.downscale and args.downscale != 1.0:
-        import cv2
-        img = cv2.resize(img, (int(W * args.downscale), int(H * args.downscale)),
-                         interpolation=cv2.INTER_AREA)
-        H, W = img.shape[:2]
-    print(f"image: {W}x{H}  device={device}")
+    import cv2
+    print(f"device={device}  input={args.input}")
+    print("per-stage timing (each line is that stage only):")
+    prof = Profiler()
 
-    # --- choose colour band(s) ---
+    # 1. load image / rasterise PDF
+    prof.step("load input (PDF render / imread)")
+    img = load_image(args.input, dpi=args.dpi, page=args.page)
+    H0, W0 = img.shape[:2]
+
+    # 2. optional downscale
+    if args.downscale and args.downscale != 1.0:
+        prof.step("downscale")
+        img = cv2.resize(img, (int(W0 * args.downscale), int(H0 * args.downscale)),
+                         interpolation=cv2.INTER_AREA)
+    H, W = img.shape[:2]
+
+    # 3. choose colour band(s)
+    prof.step("colour band selection")
     if args.hsv_lower and args.hsv_upper:
         lo = [int(x) for x in args.hsv_lower.split(",")]
         hi = [int(x) for x in args.hsv_upper.split(",")]
         bands = [(lo, hi)]
-        print(f"colour: forced HSV band {lo} .. {hi}")
     else:
         bands = auto_hsv_bands(img, k=args.colors)
         if not bands:
+            prof.done()
             print("!! no saturated colour found — is this a white/greyscale plan?")
             print("   try a forced band, e.g. --hsv-lower 0,0,0 --hsv-upper 179,255,120")
             return
-        print(f"colour: auto-detected {len(bands)} hue band(s):")
-        for lo, hi in bands:
-            print(f"          HSV {lo} .. {hi}")
 
-    # --- GPU pipeline (timed) ---
-    import cv2
+    # 4. BGR -> HSV -> GPU tensor (host->device upload)
+    prof.step("to HSV + upload to GPU")
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     hsv_t = image_to_tensor(hsv, device=device)
 
-    _sync(); t0 = time.perf_counter()
+    # 5. colour mask + morphology (per band, OR'd)
+    prof.step("color mask + morphology (GPU)")
     mask = None
-    for lo, hi in bands:                      # OR the per-band masks together
+    for lo, hi in bands:
         m = color_mask_pipeline_gpu(hsv_t, lo, hi,
                                     open_ksize=args.open_ksize,
                                     close_ksize=args.close_ksize)
         mask = m if mask is None else (mask | m)
+
+    # 6. connected components -> boxes (the iteration-bound step)
+    prof.step("connected components / label-prop (GPU)")
     boxes_t = components_boxes_gpu(mask[0, 0], min_area=args.min_area,
                                    max_iters=args.max_iters)
-    _sync(); t_cc = time.perf_counter()
 
+    # 7. device->host, build pool
+    prof.step("download boxes + build pool")
     boxes = boxes_t.cpu().tolist()
     pool = [{"bbox": [float(x) for x in b], "score": 1.0} for b in boxes]
+
+    # 8. merge / dedup
+    prof.step(f"merge / dedup ({args.merge}, GPU)")
     merge_fn = nms_gpu_assisted if args.merge == "assisted" else nms_gpu_cluster
-    _sync(); t1 = time.perf_counter()
     kept = merge_fn(pool, args.iou, args.containment, device=device)
-    _sync(); t2 = time.perf_counter()
 
-    print(f"\ncomponents: {len(boxes)} raw boxes   "
-          f"(mask+CC {1e3*(t_cc-t0):.1f} ms)")
-    print(f"merge ({args.merge}): {len(kept)} kept   "
-          f"({1e3*(t2-t1):.1f} ms)")
-    print(f"TOTAL GPU: {1e3*((t_cc-t0)+(t2-t1)):.1f} ms")
-
-    # --- annotate (boxes only, NO labels) + save ---
+    # 9. annotate + save
+    prof.step("annotate + save PNGs")
     os.makedirs(args.outdir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(args.input))[0]
     vis = img.copy()
@@ -184,6 +226,19 @@ def run(args):
     mask_png = os.path.join(args.outdir, f"{stem}_mask.png")
     cv2.imwrite(boxes_png, vis)
     cv2.imwrite(mask_png, (mask[0, 0].cpu().numpy() * 255).astype(np.uint8))
+    prof.done()
+
+    # --- report ---
+    print(f"\nimage: {W0}x{H0}" + (f" -> {W}x{H} (downscaled)" if (W, H) != (W0, H0) else ""))
+    if args.hsv_lower and args.hsv_upper:
+        print(f"colour: forced HSV band {bands[0][0]} .. {bands[0][1]}")
+    else:
+        print(f"colour: auto-detected {len(bands)} hue band(s):")
+        for lo, hi in bands:
+            print(f"          HSV {lo} .. {hi}")
+    print(f"components: {len(boxes)} raw boxes   ->   merge ({args.merge}): {len(kept)} kept")
+    print("\n=== where the time went ===")
+    prof.summary()
     print(f"\nsaved: {boxes_png}")
     print(f"saved: {mask_png}")
     return boxes_png, mask_png
