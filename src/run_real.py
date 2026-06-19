@@ -49,6 +49,8 @@ from gpu_ops import image_to_tensor, color_mask_pipeline_gpu
 from gpu_components import components_boxes_gpu
 from gpu_merge import nms_gpu_cluster, nms_gpu_assisted
 import cpu_ref
+import geometric
+import text_recover
 
 
 def _sync():
@@ -243,33 +245,213 @@ def _bordered_boxes(crop_bgr, args, min_area):
     return boxes, lines * 255, mask_ms, cc_ms
 
 
-def _detect_on_crop(crop_bgr, bands, device, args, want_mask=True):
+def _mode_list(mode):
+    """Which detector passes a mode runs."""
+    if mode == "all":
+        return ("color", "bordered", "geometric")
+    if mode == "both":
+        return ("color", "bordered")
+    return (mode,)
+
+
+def _geometric_boxes(crop_bgr, args, geo_params):
+    """Geometric line-based cell extraction (prod source 'opencv_strict').
+    Returns (boxes_as_source_dicts, mask_ms, cc_ms); boxes are CROP-LOCAL with a
+    'source' tag and optional oriented 'coords'."""
+    t0 = time.perf_counter()
+    dets = geometric.detect_array(crop_bgr, geo_params, source="opencv_strict")
+    cc_ms = (time.perf_counter() - t0) * 1e3
+    out = []
+    for d in dets:
+        x, y, w, h = d["bbox"]
+        out.append({"xyxy": [float(x), float(y), float(x + w), float(y + h)],
+                    "source": "opencv_strict", "coords": d.get("coords")})
+    return out, 0.0, cc_ms
+
+
+def _detect_on_crop(crop_bgr, bands, device, args, geo_params=None, want_mask=True):
     """Run the chosen detector(s) on ONE BGR crop (or the whole image).
 
-      --mode color    : HSV colour fills only      (owns big colour-filled halls)
-      --mode bordered : grid-line cells only        (owns dense / pale / white booths)
-      --mode both      : pool both; the global merge's merged-block pre-filter then
-                         drops any coarse colour blob that fine bordered cells tile.
+      --mode color     : HSV colour fills only       (owns big colour-filled halls)
+      --mode bordered  : grid-line cells only         (owns dense / pale / white booths)
+      --mode geometric : line-based cell extraction    (subdivides fused blocks)
+      --mode both       : colour + bordered pooled
+      --mode all        : colour + bordered + geometric (full prod ensemble)
 
-    Returns (boxes_xyxy, preview_mask_u8, mask_ms, cc_ms); boxes are CROP-LOCAL.
-    --max-area-frac caps the bordered background only (colour halls stay whole)."""
+    Returns (src_boxes, preview_mask_u8, mask_ms, cc_ms); each src_box is
+    {"xyxy":[x1,y1,x2,y2], "source":..., "coords":opt}, CROP-LOCAL."""
     ch, cw = crop_bgr.shape[:2]
     min_area = _eff_min_area(cw, ch, args)
-    modes = ("color", "bordered") if args.mode == "both" else (args.mode,)
+    modes = _mode_list(args.mode)
     boxes = []
     mask_ms = cc_ms = 0.0
     color_prev = line_prev = None
     for md in modes:
         if md == "color":
             bxs, color_prev, m_ms, c_ms = _color_boxes(crop_bgr, bands, device, args, min_area)
-        else:
+            for b in bxs:
+                boxes.append({"xyxy": [float(v) for v in b], "source": "color", "coords": None})
+        elif md == "bordered":
             bxs, line_prev, m_ms, c_ms = _bordered_boxes(crop_bgr, args, min_area)
             bxs = _area_cap(bxs, cw, ch, args.max_area_frac)
+            for b in bxs:
+                boxes.append({"xyxy": [float(v) for v in b], "source": "bordered", "coords": None})
+        else:  # geometric
+            gbxs, m_ms, c_ms = _geometric_boxes(crop_bgr, args, geo_params)
+            boxes.extend(gbxs)
         mask_ms += m_ms; cc_ms += c_ms
-        boxes.extend(bxs)
-    # the line mask is the more telling preview for dense grids; fall back to colour
     preview = line_prev if line_prev is not None else color_prev
     return boxes, preview, mask_ms, cc_ms
+
+
+# --------------------------------------------------------------------------- #
+# Fusion guards ported from prod's EnsembleDetector / tiling.py. Each pool entry
+# is {"bbox":[x1,y1,x2,y2], "score":float, "source":str, ...}.
+# --------------------------------------------------------------------------- #
+def _xyxy_area(b):
+    x1, y1, x2, y2 = b["bbox"]
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def demerge_with_bordered(pool, img_area, bordered_min_area_frac):
+    """Drop a COLOUR/GEOMETRIC box that encloses >=2 BORDERED tiles (each
+    0.10-0.70x its area and >0.70 intersection-over-tile-area) -- the colour
+    closing fused abutting same-fill booths; the bordered pass tiled them
+    correctly, so let the tiles win NMS. Verbatim logic from EnsembleDetector."""
+    min_tile = bordered_min_area_frac * img_area if bordered_min_area_frac > 0 else 0.0
+    bordered = [b for b in pool if str(b.get("source", "")).startswith("bordered")]
+    out, demerged = [], 0
+    for b in pool:
+        if str(b.get("source", "")).startswith("bordered"):
+            out.append(b)
+            continue
+        bx1, by1, bx2, by2 = b["bbox"]
+        barea = (bx2 - bx1) * (by2 - by1)
+        tiles = 0
+        for t in bordered:
+            tx1, ty1, tx2, ty2 = t["bbox"]
+            tarea = (tx2 - tx1) * (ty2 - ty1)
+            if tarea < min_tile:
+                continue
+            if not (0.10 * barea <= tarea <= 0.70 * barea):
+                continue
+            ix = max(0.0, min(tx2, bx2) - max(tx1, bx1))
+            iy = max(0.0, min(ty2, by2) - max(ty1, by1))
+            if tarea > 0 and (ix * iy) / tarea > 0.70:
+                tiles += 1
+        if tiles >= 2:
+            demerged += 1
+            continue
+        out.append(b)
+    return out, demerged
+
+
+def drop_contained(booths, ios_thresh=0.6):
+    """Drop a box when >= ios_thresh of ITS OWN area sits inside a larger kept
+    box (prod tiling._drop_contained). NMS uses IoU, which misses a small box
+    nested in a big one."""
+    def ios(a, b):
+        ax1, ay1, ax2, ay2 = a["bbox"]; bx1, by1, bx2, by2 = b["bbox"]
+        ix = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+        iy = max(0.0, min(ay2, by2) - max(ay1, by1))
+        inter = ix * iy
+        s = min(_xyxy_area(a), _xyxy_area(b))
+        return inter / s if s > 0 else 0.0
+    order = sorted(booths, key=_xyxy_area, reverse=True)
+    out = []
+    for b in order:
+        if any(ios(b, o) >= ios_thresh and _xyxy_area(o) > _xyxy_area(b) for o in out):
+            continue
+        out.append(b)
+    return out
+
+
+def _distinct_label_cells(text_items, B, cell):
+    x1, y1, x2, y2 = B["bbox"]
+    cells = set()
+    for ti in text_items:
+        cx, cy = ti["center_px"]
+        if x1 <= cx <= x2 and y1 <= cy <= y2:
+            cells.add((int(cx // cell), int(cy // cell)))
+    return len(cells)
+
+
+def big_region_pass(img, bands, device, args, geo_params, text_items, prof):
+    """Full-image pass for halls/stages/standalone-big booths that tiling
+    structurally seam-clips (any box wider/taller than the overlap is dropped in
+    every tile). Runs colour+bordered(+geometric) SEQUENTIALLY on a downscaled
+    copy, keeps only genuinely BIG boxes, NMS, then returns the big candidates.
+    Ported from tiling.detect_big_regions."""
+    import cv2
+    H, W = img.shape[:2]
+    page_area = float(W) * float(H)
+    long_edge = max(H, W)
+    me = args.big_max_edge
+    sf = (me / long_edge) if (me and long_edge > me) else 1.0
+    small = (cv2.resize(img, (int(round(W * sf)), int(round(H * sf))),
+                        interpolation=cv2.INTER_AREA) if sf < 1.0 else img)
+    inv = 1.0 / sf
+    # big-region uses its own (large) area fractions, not the dense floor
+    class _A:  # lightweight args clone with big area params
+        pass
+    ba = _A()
+    ba.__dict__.update(args.__dict__)
+    ba.min_area = 1
+    ba.min_area_frac = args.big_min_area_frac
+    ba.max_area_frac = args.big_max_area_frac
+    ba.mode = "all" if args.mode == "all" else "both"
+    sboxes, _, _, _ = _detect_on_crop(small, bands, device, ba, geo_params=geo_params)
+    raw = []
+    for b in sboxes:
+        x1, y1, x2, y2 = b["bbox"] if "bbox" in b else b["xyxy"]
+        x1, y1, x2, y2 = x1 * inv, y1 * inv, x2 * inv, y2 * inv
+        w, h = x2 - x1, y2 - y1
+        if min(w, h) < args.big_min_side_px:
+            continue
+        if w * h > args.big_max_area_frac * page_area:
+            continue
+        raw.append({"bbox": [x1, y1, x2, y2], "score": float(b.get("score", 1.0)),
+                    "source": "bigregion", "coords": None})
+    merge_fn = nms_gpu_assisted if args.merge == "assisted" else nms_gpu_cluster
+    kept = merge_fn(raw, args.iou, args.containment, device=device)
+    for k in kept:
+        k.setdefault("source", "bigregion")
+    return kept
+
+
+def merge_big_regions(small, big, text_items, coverage_thresh, max_inner_labels,
+                      label_cell_px=250):
+    """Arbitrate each big box against the crops: drop it as a HALL CONTAINER if
+    crops already cover >= coverage_thresh of it (or it holds > max_inner_labels
+    distinct label cells); otherwise keep it as a STANDALONE feature and drop the
+    stray crops inside it. Ported from tiling.merge_big_regions."""
+    def ov(a_bbox, b_bbox):
+        ax1, ay1, ax2, ay2 = a_bbox; bx1, by1, bx2, by2 = b_bbox
+        ix = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+        iy = max(0.0, min(ay2, by2) - max(ay1, by1))
+        return ix * iy
+    drop_inner = set()
+    keep_big = []
+    for B in big:
+        Ba = _xyxy_area(B)
+        if Ba <= 0:
+            continue
+        inner_area = 0.0
+        overlapping = []
+        for s in small:
+            ia = ov(s["bbox"], B["bbox"])
+            if ia > 0:
+                overlapping.append(s)
+                inner_area += ia
+        coverage = inner_area / Ba
+        n_labels = _distinct_label_cells(text_items, B, label_cell_px)
+        if coverage >= coverage_thresh or n_labels > max_inner_labels:
+            continue  # container -> drop big, keep crops
+        for s in overlapping:
+            drop_inner.add(id(s))
+        keep_big.append(B)
+    out = [s for s in small if id(s) not in drop_inner] + keep_big
+    return out, len(keep_big), len(drop_inner)
 
 
 # --------------------------------------------------------------------------- #
@@ -341,6 +523,9 @@ def run(args):
             print("   try a forced band, e.g. --hsv-lower 0,0,0 --hsv-upper 179,255,120")
             return
 
+    # geometric pass params (prod OpenCVDetector tuning; tilt optional per-tile)
+    geo_params = geometric.GeoParams(enable_tilt=not args.no_geo_tilt)
+
     # 4. detect — tiled dense pass (default), or single full-image pass (--tile 0)
     use_tiling = bool(args.tile) and args.tile > 0 and max(H, W) > args.tile
     mask_ms_tot = cc_ms_tot = 0.0
@@ -363,33 +548,90 @@ def run(args):
                 y2c, x2c = min(gy0 + args.tile, H), min(gx0 + args.tile, W)
                 crop = img[gy0:y2c, gx0:x2c]
                 ch, cw = crop.shape[:2]
-                boxes, mnp, m_ms, c_ms = _detect_on_crop(crop, bands, device, args)
+                boxes, mnp, m_ms, c_ms = _detect_on_crop(crop, bands, device, args,
+                                                         geo_params=geo_params)
                 mask_ms_tot += m_ms; cc_ms_tot += c_ms
                 if mnp is not None:                      # stitch (overlap -> max)
                     sub = mask_full[gy0:y2c, gx0:x2c]
                     np.maximum(sub, mnp, out=sub)
                 n_raw += len(boxes)
-                for bx1, by1, bx2, by2 in boxes:
+                for sb in boxes:
+                    bx1, by1, bx2, by2 = sb["xyxy"]
                     if _clipped_xyxy(bx1, by1, bx2, by2, cw, ch, gx0, gy0, W, H,
                                      edge=args.seam_edge):
                         continue                         # neighbour tile holds it whole
-                    pool.append({"bbox": [float(bx1 + gx0), float(by1 + gy0),
-                                          float(bx2 + gx0), float(by2 + gy0)],
-                                 "score": 1.0})
+                    rec = {"bbox": [bx1 + gx0, by1 + gy0, bx2 + gx0, by2 + gy0],
+                           "score": 1.0, "source": sb["source"]}
+                    if sb.get("coords"):
+                        rec["coords"] = [[p[0] + gx0, p[1] + gy0] for p in sb["coords"]]
+                    pool.append(rec)
         print(f"  tiles: {n_raw} raw boxes across tiles -> {len(pool)} after seam-clip")
     else:
         prof.step("color mask + CC (single full-image pass)")
-        boxes, mask_full, m_ms, c_ms = _detect_on_crop(img, bands, device, args)
+        boxes, mask_full, m_ms, c_ms = _detect_on_crop(img, bands, device, args,
+                                                       geo_params=geo_params)
         mask_ms_tot += m_ms; cc_ms_tot += c_ms
-        pool = [{"bbox": [float(v) for v in b], "score": 1.0} for b in boxes]
+        pool = [{"bbox": [float(v) for v in b["xyxy"]], "score": 1.0,
+                 "source": b["source"], **({"coords": b["coords"]} if b.get("coords") else {})}
+                for b in boxes]
 
     raw_count = len(pool)
 
-    # 5. merge / dedup (GPU) — fuses the overlap-band duplicates from neighbouring
-    #    tiles plus any nested fragments, exactly as the prod global NMS does.
+    img_area = float(W) * float(H)
+
+    # 5a. de-merge: drop a colour/geometric box that the bordered pass already
+    #     tiled into >=2 sub-cells (prod EnsembleDetector.demerge_with_bordered).
+    demerged = 0
+    if args.demerge:
+        prof.step("demerge (drop bordered-tiled fused boxes)")
+        pool, demerged = demerge_with_bordered(pool, img_area, args.min_area_frac)
+
+    # 5b. merge / dedup (GPU) — fuses overlap-band duplicates + nested fragments,
+    #     exactly as the prod global NMS does.
     prof.step(f"merge / dedup ({args.merge}, GPU)")
     merge_fn = nms_gpu_assisted if args.merge == "assisted" else nms_gpu_cluster
     kept = merge_fn(pool, args.iou, args.containment, device=device)
+    # IoS containment drop (prod tiling._drop_contained): small box nested in a
+    # bigger one survives IoU-NMS, so remove it here.
+    kept = drop_contained(kept, args.containment)
+    for k in kept:
+        k.setdefault("source", "color")
+
+    # 5c. text-layer extraction (PDF vector text) — feeds big-region arbitration,
+    #     labeling, and recovery. Empty for raster inputs.
+    text_items = []
+    is_pdf = os.path.splitext(args.input)[1].lower() == ".pdf"
+    if is_pdf and (args.big_pass or args.text_recover or args.label):
+        prof.step("extract PDF text layer (fitz)")
+        try:
+            text_items = text_recover.extract_text_items_pdf_fitz(args.input, args.dpi, args.page)
+        except Exception as e:  # noqa: BLE001
+            print(f"  !! text-layer extraction failed ({e}); continuing without text")
+
+    # 5d. big-region pass — recover halls/stages tiling structurally seam-clips,
+    #     then arbitrate each against the crops by coverage.
+    n_big_kept = n_inner_absorbed = 0
+    if args.big_pass:
+        prof.step("big-region pass (full-image, downscaled)")
+        big = big_region_pass(img, bands, device, args, geo_params, text_items, prof)
+        kept, n_big_kept, n_inner_absorbed = merge_big_regions(
+            kept, big, text_items, args.big_coverage_thresh, args.big_max_inner_labels)
+        print(f"  big-region: {len(big)} candidates -> {n_big_kept} standalone kept, "
+              f"{n_inner_absorbed} inner crops absorbed")
+
+    # 5e. label booths from the PDF text, then recover any booth-number token that
+    #     no detected box covers (the "are we using the texts?" recall net).
+    n_recovered = 0
+    if text_items:
+        prof.step("label + text recovery")
+        text_recover.label_booths(kept, text_items)
+        if args.text_recover:
+            n_recovered = text_recover.recover_missing(kept, text_items)
+        # strict FP policy (prod POLICIES["strict"]): final output is ONLY the
+        # text-labelled (boothlike) booths -- this is what cuts the false
+        # positives down to the real booth count.
+        if args.fp_policy == "strict":
+            kept = [b for b in kept if b.get("text_status") == "boothlike"]
 
     # 6. annotate + save
     prof.step("annotate + save PNGs")
@@ -418,7 +660,9 @@ def run(args):
     for b in kept:
         x1, y1, x2, y2 = (float(v) for v in b["bbox"])
         recs.append({"bbox": [x1, y1, x2, y2], "score": float(b.get("score", 1.0)),
-                     "w": x2 - x1, "h": y2 - y1, "area": (x2 - x1) * (y2 - y1)})
+                     "w": x2 - x1, "h": y2 - y1, "area": (x2 - x1) * (y2 - y1),
+                     "source": b.get("source", ""), "label": b.get("label", ""),
+                     "text_status": b.get("text_status", "")})
     json_path = os.path.join(args.outdir, f"{stem}_boxes.json")
     with open(json_path, "w") as f:
         json.dump({"input": os.path.basename(args.input),
@@ -426,6 +670,10 @@ def run(args):
                    "detector": args.mode,
                    "tiling": (total if use_tiling else 0),
                    "merge": args.merge,
+                   "stages": {"demerged": demerged, "big_kept": n_big_kept,
+                              "inner_absorbed": n_inner_absorbed,
+                              "text_recovered": n_recovered,
+                              "n_text_items": len(text_items)},
                    "params": {"tile": args.tile, "overlap": args.overlap,
                               "min_area": args.min_area, "line_thresh": args.line_thresh,
                               "seal_ksize": args.seal_ksize, "max_area_frac": args.max_area_frac,
@@ -444,6 +692,18 @@ def run(args):
     tiling_desc = f"tiled ({total} tiles)" if use_tiling else "single full-image pass"
     print(f"detector: {args.mode}   |   {tiling_desc}")
     print(f"components: {raw_count} pooled boxes   ->   merge ({args.merge}): {len(kept)} kept")
+    by_src = {}
+    for r in recs:
+        by_src[r["source"]] = by_src.get(r["source"], 0) + 1
+    print(f"  by source: {by_src}")
+    if args.demerge:
+        print(f"  demerged (fused boxes dropped): {demerged}")
+    if args.big_pass:
+        print(f"  big-region: {n_big_kept} standalone kept, {n_inner_absorbed} inner absorbed")
+    if text_items:
+        n_boothlike = sum(1 for r in recs if r["text_status"] == "boothlike")
+        print(f"  text layer: {len(text_items)} spans   |   boothlike-labelled boxes: {n_boothlike}"
+              f"   |   text-recovered: {n_recovered}")
     if recs:
         a = np.array([r["area"] for r in recs])
         wv = np.array([r["w"] for r in recs])
@@ -481,8 +741,12 @@ def main():
                     help="overlap between adjacent tiles in px (a booth in the seam is held by the neighbour)")
     ap.add_argument("--seam-edge", type=int, default=4,
                     help="drop boxes within this many px of an INNER tile seam (neighbour holds them whole)")
-    ap.add_argument("--mode", choices=["color", "bordered", "both"], default="both",
-                    help="detector: colour fills, grid-line cells, or both pooled (default)")
+    ap.add_argument("--mode", choices=["color", "bordered", "geometric", "both", "all"],
+                    default="all",
+                    help="detector: colour fills, grid-line cells, geometric line-extraction, "
+                         "both (colour+bordered), or all (full prod ensemble; default)")
+    ap.add_argument("--no-geo-tilt", action="store_true",
+                    help="[geometric] disable the oriented (tilted-hall) pass for speed")
     ap.add_argument("--line-thresh", type=int, default=128,
                     help="[bordered] pixels darker than this are grid lines/borders (0..255)")
     ap.add_argument("--seal-ksize", type=int, default=3,
@@ -509,6 +773,33 @@ def main():
                          "cluster = aggressive connected-component grouping")
     ap.add_argument("--iou", type=float, default=0.4, help="merge IoU suppression threshold (prod = 0.4)")
     ap.add_argument("--containment", type=float, default=0.6, help="merge IoS containment threshold (prod = 0.6)")
+    # --- full-pipeline stages ported from prod (on by default) ---
+    ap.add_argument("--demerge", dest="demerge", action="store_true", default=True,
+                    help="drop a colour/geometric box the bordered pass already tiled into >=2 cells")
+    ap.add_argument("--no-demerge", dest="demerge", action="store_false")
+    ap.add_argument("--big-pass", dest="big_pass", action="store_true", default=True,
+                    help="full-image big-region pass to recover halls/stages tiling seam-clips")
+    ap.add_argument("--no-big-pass", dest="big_pass", action="store_false")
+    ap.add_argument("--big-max-edge", type=int, default=10000,
+                    help="[big] downscale the full page so its long edge <= this before the big pass")
+    ap.add_argument("--big-min-side-px", type=int, default=700,
+                    help="[big] keep only big boxes whose min side >= this (full px)")
+    ap.add_argument("--big-min-area-frac", type=float, default=8e-4,
+                    help="[big] colour/bordered min-area fraction for the big pass")
+    ap.add_argument("--big-max-area-frac", type=float, default=0.5,
+                    help="[big] drop big boxes larger than this fraction of the page")
+    ap.add_argument("--big-coverage-thresh", type=float, default=0.15,
+                    help="[big] crops covering >= this fraction of a big box => it's a hall container (drop)")
+    ap.add_argument("--big-max-inner-labels", type=int, default=6,
+                    help="[big] a big box holding more distinct label cells than this is a packed grid (drop)")
+    ap.add_argument("--text-recover", dest="text_recover", action="store_true", default=True,
+                    help="[PDF] synthesise a box at every booth-number token no detected box covers")
+    ap.add_argument("--no-text-recover", dest="text_recover", action="store_false")
+    ap.add_argument("--label", dest="label", action="store_true", default=True,
+                    help="[PDF] attach the PDF text layer to each booth and tag it")
+    ap.add_argument("--no-label", dest="label", action="store_false")
+    ap.add_argument("--fp-policy", choices=["none", "strict"], default="strict",
+                    help="strict keeps only text-labelled (boothlike) + shape-source booths (prod default)")
     ap.add_argument("--outdir", default="out")
     args = ap.parse_args()
     run(args)
