@@ -16,24 +16,42 @@ docker compose build          # or: docker build -t booth-gpu:latest .
 The image bundles CUDA 12.1 + torch/torchvision, OpenCV, PyMuPDF (PDF render),
 EasyOCR (raster/scanned labeling), and cupy + cuCIM (fast RAPIDS CCL).
 
-## Run
-Put a floor plan in `./data`, then:
+## Run (recommended: `docker compose up`)
 ```bash
-# Vector PDF — dense plan, best recall:
-docker compose run --rm booth --input /data/IIJS_2017.pdf --fp-policy shape --outdir /data/out
+mkdir -p data out models
+cp /path/to/your_plan.pdf data/
 
-# Raster image / flattened PDF — OCR fires automatically (--ocr auto is default):
-docker compose run --rm booth --input /data/PU-TECH-2027.jpg --fp-policy strict --outdir /data/out
+# builds the image the first time, then runs the pipeline on $INPUT:
+INPUT=/data/your_plan.pdf docker compose up --build
+
+# later runs (image already built) — just:
+INPUT=/data/another_plan.jpg docker compose up
 ```
-Outputs (`*_boxes.json`, `*_boxes.png`, `*_mask.png`) land in `./data/out`.
+Knobs are env vars (all optional except INPUT):
+| Env | Default | Meaning |
+|---|---|---|
+| `INPUT` | (required) | Path inside the container, e.g. `/data/plan.pdf`. |
+| `FP_POLICY` | `shape` | `adaptive` / `shape` / `strict` / `none`. |
+| `OCR` | `auto` | `auto` / `on` / `off`. |
+| `EXTRA_ARGS` | (none) | Any extra run_real flags, e.g. `"--dpi 300 --workers 8"`. |
 
-`./models` is mounted so EasyOCR's downloaded weights persist between runs
-(first OCR run downloads them once).
+Examples:
+```bash
+INPUT=/data/PU-TECH-2027.jpg FP_POLICY=strict docker compose up
+INPUT=/data/IIJS_2017.pdf EXTRA_ARGS="--dpi 300" docker compose up
+```
+Outputs (`*_boxes.json`, `*_boxes.png`, `*_mask.png`) land in `./out`.
+`./models` persists EasyOCR weights (downloaded once on first OCR run).
+
+## One-off run via compose (no long-lived service)
+```bash
+docker compose run --rm booth --input /data/plan.pdf --fp-policy shape --outdir /data/out
+```
 
 ## Without compose (plain docker)
 ```bash
 docker run --rm --gpus all \
-  -v "$PWD/data:/data" -v "$PWD/models:/models" \
+  -v "$PWD/data:/data" -v "$PWD/out:/data/out" -v "$PWD/models:/models" \
   booth-gpu:latest --input /data/plan.pdf --fp-policy shape --outdir /data/out
 ```
 
