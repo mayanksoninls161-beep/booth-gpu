@@ -79,7 +79,9 @@ def _label_cucim(mask, connectivity):
     cm = _cp.asarray(m) != 0                      # zero-copy view of the torch tensor
     conn = 1 if connectivity == 4 else 2
     lab = _cucim_label(cm, connectivity=conn)     # CuPy int label image, 0 = bg
-    return torch.from_dlpack(lab.toDlpack()).to(torch.int64)
+    # CuPy arrays expose __dlpack__, so torch.from_dlpack ingests them directly
+    # (avoids the deprecated cupy .toDlpack()).
+    return torch.from_dlpack(lab).to(torch.int64)
 
 
 def _max_pool_neighbors(labels, connectivity=8, ksize=3):
