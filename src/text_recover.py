@@ -19,8 +19,16 @@ import re
 from typing import Dict, List
 
 RE_AREA = re.compile(r"\d{1,4}\s*(?:sq\.?\s*m(?:tr)?|sqm|m2|m²)\b", re.I)
+# Booth IDs come in many short forms. The original pattern demanded >=2 digits
+# after the letters, which threw away single-digit-suffix IDs that are extremely
+# common on real plans (F4, R4, P9, D4, G6, S4 ...) and digit-then-letter IDs
+# with no trailing digit (6X, 1L) -> those got tagged "text" instead of
+# "boothlike" and were dropped under strict policy even though the PDF carried
+# the label. Loosened: letter-prefix needs >=1 digit; digit-prefix allows 0
+# trailing digits. At least one digit is still required, so plain words (NEW,
+# CAFE, BOX OFFICE) stay rejected.
 RE_BOOTH = re.compile(
-    r"\b(?:[A-Z]{1,3}[-\s]?\d{2,4}|\d{1,2}[A-Z]{1,2}[-\s]?\d{1,4})[A-Z]?\b")
+    r"\b(?:[A-Z]{1,3}[-\s]?\d{1,4}|\d{1,2}[A-Z]{1,2}[-\s]?\d{0,4})[A-Z]?\b")
 RE_COMPANY = re.compile(
     r"\b(?:PVT|LTD|LLP|INC|LLC|EXPORTS?|IMPEX|INDUSTR|ENTERPRIS|"
     r"INTERNATIONAL|TRADERS?|OVERSEAS|LIFECARE|TECHNOLOG)\b", re.I)
@@ -43,6 +51,62 @@ def tag_from_label(label: str) -> str:
     if RE_FACILITY.search(label):
         return "facility"
     return "text"
+
+
+_OCR_READER = None
+
+
+def _get_ocr_reader(gpu: bool = True):
+    """Lazy, cached EasyOCR reader. EasyOCR (not PaddleOCR) is used because it is
+    far more robust on blurry / low-res raster floor plans, where booth IDs are a
+    few pixels tall. The model loads once per process."""
+    global _OCR_READER
+    if _OCR_READER is None:
+        import easyocr  # heavy import; only when OCR is actually requested
+        _OCR_READER = easyocr.Reader(["en"], gpu=gpu)
+    return _OCR_READER
+
+
+def extract_text_items_ocr(img_bgr, gpu: bool = True, min_conf: float = 0.30,
+                           tile: int = 0, overlap: int = 256) -> List[Dict]:
+    """OCR fallback for rasters / flattened PDFs with NO vector text layer.
+
+    Returns the SAME structure as extract_text_items_pdf_fitz
+    ([{text, bbox_px(x0,y0,x1,y1), center_px}], render-pixel coords) so the
+    downstream labeler/recovery is identical. `img_bgr` is the already-rendered
+    image array (cv2 BGR), so OCR coords are inherently in render pixels — no
+    scaling needed. Large images are optionally tiled so EasyOCR's detector keeps
+    small glyphs (booth IDs are only a few px tall on dense plans)."""
+    reader = _get_ocr_reader(gpu=gpu)
+    H, W = img_bgr.shape[:2]
+    items: List[Dict] = []
+
+    def _run(crop, ox, oy):
+        for box, txt, conf in reader.readtext(crop):
+            txt = (txt or "").strip()
+            if not txt or conf < min_conf:
+                continue
+            xs = [p[0] for p in box]
+            ys = [p[1] for p in box]
+            x0, y0 = min(xs) + ox, min(ys) + oy
+            x1, y1 = max(xs) + ox, max(ys) + oy
+            items.append({"text": txt, "bbox_px": (x0, y0, x1, y1),
+                          "center_px": ((x0 + x1) / 2.0, (y0 + y1) / 2.0)})
+
+    if tile and max(H, W) > tile:
+        step = max(1, tile - overlap)
+        for oy in range(0, H, step):
+            for ox in range(0, W, step):
+                _run(img_bgr[oy:min(oy + tile, H), ox:min(ox + tile, W)], ox, oy)
+        # tiles overlap -> dedup identical text at near-identical centers
+        seen = {}
+        for it in items:
+            key = (it["text"], round(it["center_px"][0] / 8), round(it["center_px"][1] / 8))
+            seen.setdefault(key, it)
+        items = list(seen.values())
+    else:
+        _run(img_bgr, 0, 0)
+    return items
 
 
 def extract_text_items_pdf_fitz(pdf_path: str, dpi: int, page_index: int = 0) -> List[Dict]:

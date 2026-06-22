@@ -773,12 +773,29 @@ def run(args):
     #     labeling, and recovery. Empty for raster inputs.
     text_items = []
     is_pdf = os.path.splitext(args.input)[1].lower() == ".pdf"
-    if is_pdf and (args.big_pass or args.text_recover or args.label):
+    want_text = args.big_pass or args.text_recover or args.label
+    if is_pdf and want_text:
         prof.step("extract PDF text layer (fitz)")
         try:
             text_items = text_recover.extract_text_items_pdf_fitz(args.input, args.dpi, args.page)
         except Exception as e:  # noqa: BLE001
             print(f"  !! text-layer extraction failed ({e}); continuing without text")
+        print(f"  PDF vector text layer: {len(text_items)} spans")
+
+    # OCR fallback: rasters have no text layer, and flattened/scanned PDFs return
+    # an empty one. EasyOCR reads the printed booth IDs straight off the rendered
+    # image (coords already in render pixels). 'auto' fires only when the vector
+    # layer gave us nothing, so vector PDFs pay no OCR cost.
+    if want_text and args.ocr != "off" and (args.ocr == "on" or not text_items):
+        prof.step("OCR text layer (EasyOCR)")
+        try:
+            text_items = text_recover.extract_text_items_ocr(
+                img, gpu=(device == "cuda"),
+                min_conf=args.ocr_min_conf, tile=args.ocr_tile)
+            print(f"  OCR text layer: {len(text_items)} spans")
+        except Exception as e:  # noqa: BLE001
+            print(f"  !! OCR failed ({e}); continuing without text "
+                  "(`pip install easyocr` for the OCR fallback)")
 
     # 5d. big-region pass — recover halls/stages tiling structurally seam-clips,
     #     then arbitrate each against the crops by coverage.
@@ -1047,6 +1064,15 @@ def main():
                     help="adaptive (prod default): strict when >=15%% of booths are "
                          "boothlike, else shape; strict=only boothlike; shape=trust "
                          "shape-source geometry; none=keep everything")
+    ap.add_argument("--ocr", choices=["auto", "on", "off"], default="auto",
+                    help="OCR fallback (EasyOCR) for labeling when there is no PDF "
+                         "vector text layer (raster images, flattened/scanned PDFs). "
+                         "auto=run OCR only when the vector layer is empty/absent; "
+                         "on=always run OCR; off=never")
+    ap.add_argument("--ocr-tile", type=int, default=1800,
+                    help="tile size for OCR on large renders (0=whole image at once)")
+    ap.add_argument("--ocr-min-conf", type=float, default=0.30,
+                    help="drop OCR spans below this confidence")
     # --- Roboflow hall model (same model prod runs alongside booths) ---
     ap.add_argument("--roboflow-hall", dest="roboflow_hall", action="store_true", default=False,
                     help="run the Roboflow hall_detection/6 model (needs ROBOFLOW_HALL_API_KEY env "

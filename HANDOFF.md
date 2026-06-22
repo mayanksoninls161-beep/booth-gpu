@@ -53,7 +53,16 @@ Render = **9528×7987 px** — identical in prod and GPU (dpi was never a diverg
 | `1b53d23` | adaptive FP policy | Adds `resolve_adaptive()` + `apply_fp_policy()`. Fixes an 87-booth under-recall caused by a hard-coded strict filter on a plan with pure-numeric booth IDs. |
 | `63fb8dc` | geometric fidelity + NMS source scores | `geometric.py`: corrects 3 drifted params to match prod. `run_real.py`: restores per-source NMS scores (had been flattened to 1.0). |
 | `c9b40e8` | bordered recovery + tile concurrency | Adds `recover_uncovered_bordered()` and `ThreadPoolExecutor` tile concurrency. |
-| (latest) | GPU geometric backend | New `src/geometric_gpu.py` — CUDA reimplementation of the `opencv_strict` pass (the dominant CPU cost). Opt-in via `--geo-backend {cpu,gpu,auto}` (default `cpu`). |
+| `6f59fa1` | exact medianBlur floor | `geometric_gpu.py`: replaced the morphological close/open background-floor approximation with exact `cv2.medianBlur` (CPU, re-uploaded). Fixed 159 dropped small cells on IIJS. |
+| (uncommitted) | OCR fallback + looser booth regex | `text_recover.py`: looser `RE_BOOTH` (single-digit suffix `F4`/`P9`, digit-then-letter `6X`/`1L`) + new `extract_text_items_ocr` (EasyOCR). `run_real.py`: `--ocr {auto,on,off}` fallback when no PDF vector text layer. |
+
+### Latest session (OOAK / IIJS / PU-TECH — recall + labeling)
+- **medianBlur fix verified on IIJS:** boothlike recall 80.1% → **96.6%**, fused 28 → 0, and faster (40s vs 56s).
+- **fp-policy `shape` re-runs (recommended for dense plans):**
+  - OOAK: strict 675 → **shape 917** (recovered 145 `text` + 97 `empty` real cells).
+  - IIJS: strict 1071 → **shape 1155**; vs prod → **recall 99.9%** (1 true-miss / 1010 boothlike), **precision 98.4%** (1137/1155 land on a prod box).
+- **Root-cause of "text in PDF but tagged empty" — NOT a scaling bug.** `extract_text_items_pdf_fitz` scales by `dpi/72` with fitz's top-left origin (no y-flip) — coords are correct. The failure was the **`RE_BOOTH` regex**: it demanded ≥2 digits after letters, so single-digit IDs (`F4`,`R4`,`P9`,`D4`,`G6`,`S4`) and digit-then-letter IDs (`6X`,`1L`) were tagged `text` not `boothlike` → dropped by strict. Loosened the regex so strict now keeps them. (Still rejects plain words `NEW`/`CAFE`/`TOILET` — at least one digit required.)
+- **OCR fallback added (EasyOCR).** Rasters (`.jpg`) and flattened/scanned PDFs have no vector text layer → previously every box was unlabeled → strict kept 0. Now `--ocr auto` runs EasyOCR on the rendered image (coords already in render px, no scaling) when the vector layer is empty; vector PDFs skip OCR. Tiles large renders (`--ocr-tile`, default 1800). Needs `pip install easyocr`.
 
 ### GPU geometric detector (`src/geometric_gpu.py`)
 Moves the geometric pass's CPU-bound CV ops onto the GPU as pure torch tensor ops:
@@ -98,9 +107,12 @@ Effect: `opencv_strict` 226 → 957. Rest of `detect_array` / `_extract_booths` 
 ### New CLI flags
 | Flag | Default | Meaning |
 |---|---|---|
-| `--fp-policy {none,strict,shape,adaptive}` | `adaptive` | Which keep-policy to apply. |
+| `--fp-policy {none,strict,shape,adaptive}` | `adaptive` | Which keep-policy to apply. **Use `shape` for dense plans** (best recall). |
 | `--no-recover-bordered` | recovery ON | Disable bordered micro-cell recovery. |
 | `--workers N` | `0` (auto = `min(8, cpu_count)`) | Tile worker threads. |
+| `--ocr {auto,on,off}` | `auto` | EasyOCR fallback labeling when no PDF vector text layer (rasters / flattened PDFs). |
+| `--ocr-tile N` | `1800` | OCR tile size for large renders (0 = whole image). |
+| `--ocr-min-conf F` | `0.30` | Drop OCR spans below this confidence. |
 
 ---
 
