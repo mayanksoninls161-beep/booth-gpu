@@ -18,9 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Python deps. cupy + cucim give the fast RAPIDS union-find CCL path
+# CLI/detection deps. cupy + cucim give the fast RAPIDS union-find CCL path
 # (--ccl cucim); they match the CUDA 12 base. Pinned-loosely to stay current.
-COPY requirements.txt ./requirements.txt
 RUN pip install --upgrade pip && pip install \
         "opencv-python-headless>=4.8" \
         "numpy>=1.24" \
@@ -29,13 +28,26 @@ RUN pip install --upgrade pip && pip install \
         "cupy-cuda12x" \
         "cucim-cu12"
 
+# API-layer deps (FastAPI service + Roboflow endpoints). Separate layer so
+# editing app code doesn't rebuild the heavy CLI/CUDA layer above.
+COPY requirements-api.txt ./requirements-api.txt
+RUN pip install -r requirements-api.txt
+
 # App code last so source edits don't bust the dependency layer.
 COPY . /app
 
-# Where the user mounts inputs and where outputs are written.
-RUN mkdir -p /data /models/easyocr
+# Data dirs (overlaid by the bind mount at runtime) + model caches.
+RUN mkdir -p /data/in /data/out /data/logs /models/easyocr
+ENV PYTHONPATH=/app/server:/app/src:/app \
+    LOG_DIR=/data/logs \
+    HASH_DB_PATH=/data/hash_db.json \
+    PERSIST_IN_DIR=/data/in \
+    PERSIST_OUT_DIR=/data/out \
+    S3_WRITEBACK_ENABLED=false
 VOLUME ["/data", "/models"]
 
-# Default outdir -> /data/out so results land on the mounted volume.
-ENTRYPOINT ["python", "src/run_real.py"]
-CMD ["--help"]
+# Default: serve the FastAPI app (same endpoints as prod). For one-off CLI
+# detection, override the entrypoint (see docker-compose `booth-cli` service).
+EXPOSE 8000
+WORKDIR /app/server
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

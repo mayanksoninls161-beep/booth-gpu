@@ -15,3 +15,7 @@ tests/
 *.json
 HANDOFF.md
 README.md
+
+.env
+.env.*
+!.env.example

@@ -10,3 +10,8 @@ fixtures/boxes_pool_real.json
 
 # run_real.py annotated previews
 out/
+
+# secrets
+.env
+.env.*
+!.env.example

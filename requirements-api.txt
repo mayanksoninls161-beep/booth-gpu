@@ -1,0 +1,15 @@
+# API-layer deps on top of the CLI stack (torch/opencv/pymupdf/easyocr are
+# installed in the Dockerfile). These power the FastAPI service + the two
+# Roboflow endpoints (/predict, /debug_predict) copied from prod.
+fastapi==0.115.14
+uvicorn[standard]==0.49.0
+python-multipart==0.0.32
+python-dotenv==1.0.1
+httpx==0.28.1
+ImageHash==4.3.2
+piexif==1.1.3
+scikit-learn>=1.4
+scikit-image>=0.22
+boto3==1.41.5
+# Roboflow inference SDK (icon/trail/hall models). Heavy; pinned to prod.
+inference==1.3.0

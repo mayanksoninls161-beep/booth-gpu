@@ -1,71 +1,78 @@
-# Running booth-gpu on a GPU server (Docker)
+# Booth-GPU on a GPU server (Docker)
+
+Serves the **same API as production**, with the booth endpoint running the GPU
+pipeline:
+
+| Method | Endpoint | What |
+|---|---|---|
+| POST | `/predict` | icons + trails (Roboflow) — copied from prod |
+| POST | `/debug_predict` | trail debug (Roboflow) — copied from prod |
+| POST | `/hall_with_booth_predict` | Roboflow hall + **GPU** booth pipeline |
+| GET | `/health` | liveness |
+
+All POSTs require header `Authentication-API-Key: <AUTHENTICATION_API_KEY>`.
 
 ## Prerequisites (host)
-- NVIDIA GPU + driver, and the **NVIDIA Container Toolkit** installed.
-- Verify GPU is visible to Docker:
+- NVIDIA GPU + driver + **NVIDIA Container Toolkit**. Verify:
   ```bash
   docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
   ```
 
-## Build
+## Build & run the API
 ```bash
-git clone https://github.com/mayanksoninls161-beep/booth-gpu.git
-cd booth-gpu
-docker compose build          # or: docker build -t booth-gpu:latest .
-```
-The image bundles CUDA 12.1 + torch/torchvision, OpenCV, PyMuPDF (PDF render),
-EasyOCR (raster/scanned labeling), and cupy + cuCIM (fast RAPIDS CCL).
+git clone <repo-url> booth-gpu && cd booth-gpu
+cp .env.example .env          # fill in AUTHENTICATION_API_KEY + Roboflow keys
+mkdir -p data models
 
-## Run (recommended: `docker compose up`)
+docker compose up -d --build api
+curl -fsS localhost:8000/health
+```
+
+### Call the booth endpoint
 ```bash
-mkdir -p data out models
-cp /path/to/your_plan.pdf data/
+# PDF floor plan (best recall with shape policy):
+curl -s -X POST localhost:8000/hall_with_booth_predict \
+  -H "Authentication-API-Key: $AUTHENTICATION_API_KEY" \
+  -F "pdf_url=https://.../IIJS_2017.pdf" \
+  -F "fp_policy=shape"
 
-# builds the image the first time, then runs the pipeline on $INPUT:
-INPUT=/data/your_plan.pdf docker compose up --build
-
-# later runs (image already built) — just:
-INPUT=/data/another_plan.jpg docker compose up
+# Raster image (OCR fires automatically when there's no PDF text layer):
+curl -s -X POST localhost:8000/hall_with_booth_predict \
+  -H "Authentication-API-Key: $AUTHENTICATION_API_KEY" \
+  -F "image_url=https://.../PU-TECH-2027.jpg" \
+  -F "fp_policy=strict"
 ```
-Knobs are env vars (all optional except INPUT):
-| Env | Default | Meaning |
+Response shape matches prod: `{hash, date, hash_status, s3_writeback,
+hall_predictions, booth_detections:{count,booths}, hall_booth_map}`.
+Hall boxes, booths, and the hall→booth map all share the render pixel space.
+
+Form fields: `image_url`, `pdf_url` (PDF wins when both), `page` (default 0),
+`fp_policy` (none/strict/shape/adaptive; default `BOOTH_FP_POLICY=shape`),
+`hall_conf` (default 0.50).
+
+## One-off CLI detection (no API / no Roboflow key)
+```bash
+# put a plan in ./data/in, then:
+docker compose run --rm booth-cli --input /data/in/plan.pdf --fp-policy shape --outdir /data/out
+```
+
+## Config (env / .env)
+| Var | Default | Meaning |
 |---|---|---|
-| `INPUT` | (required) | Path inside the container, e.g. `/data/plan.pdf`. |
-| `FP_POLICY` | `shape` | `adaptive` / `shape` / `strict` / `none`. |
-| `OCR` | `auto` | `auto` / `on` / `off`. |
-| `EXTRA_ARGS` | (none) | Any extra run_real flags, e.g. `"--dpi 300 --workers 8"`. |
-
-Examples:
-```bash
-INPUT=/data/PU-TECH-2027.jpg FP_POLICY=strict docker compose up
-INPUT=/data/IIJS_2017.pdf EXTRA_ARGS="--dpi 300" docker compose up
-```
-Outputs (`*_boxes.json`, `*_boxes.png`, `*_mask.png`) land in `./out`.
-`./models` persists EasyOCR weights (downloaded once on first OCR run).
-
-## One-off run via compose (no long-lived service)
-```bash
-docker compose run --rm booth --input /data/plan.pdf --fp-policy shape --outdir /data/out
-```
-
-## Without compose (plain docker)
-```bash
-docker run --rm --gpus all \
-  -v "$PWD/data:/data" -v "$PWD/out:/data/out" -v "$PWD/models:/models" \
-  booth-gpu:latest --input /data/plan.pdf --fp-policy shape --outdir /data/out
-```
-
-## Useful flags
-| Flag | Use |
-|---|---|
-| `--fp-policy {adaptive,shape,strict,none}` | Keep-policy. `shape` = best recall on dense plans. |
-| `--ocr {auto,on,off}` | EasyOCR fallback (auto: only when no PDF text layer). |
-| `--ccl {auto,cucim,prop}` | `cucim` = fast GPU connected-components (default auto). |
-| `--geo-backend {auto,gpu,cpu}` | GPU geometric pass. |
-| `--dpi N` | PDF render DPI (default 250). |
-| `--workers N` | CPU tile workers (CPU geo backend only). |
+| `AUTHENTICATION_API_KEY` | (required) | API key clients must send. |
+| `ROBOFLOW_ICON_API_KEY` | — | `/predict` icons. |
+| `ROBOFLOW_TRAIL_API_KEY` | — | `/predict`, `/debug_predict` trails. |
+| `ROBOFLOW_HALL_API_KEY` | — | `/hall_with_booth_predict` halls. |
+| `BOOTH_FP_POLICY` | `shape` | Default keep-policy for the booth pipeline. |
+| `BOOTH_DPI` | `250` | PDF render DPI. |
+| `HALL_RASTER_MAX_EDGE` | `2048` | Downscale cap before hall inference. |
+| `S3_WRITEBACK_ENABLED` | `false` | Keep OFF (constraint). Private-S3 *reads* still work with AWS creds. |
 
 ## Notes
-- `ROBOFLOW_HALL_API_KEY` is read from the host env (compose passes it through);
-  only needed with `--roboflow-hall`. Never bake it into the image.
-- Keep AWS/S3 writeback OFF; the container only reads/writes the mounted `/data`.
+- Roboflow models load lazily on first use, so the API boots even without keys;
+  the booth pipeline needs no Roboflow key at all.
+- `./models` + the `easyocr-cache`/`model-cache` volumes persist downloaded
+  weights across runs (first OCR / Roboflow call downloads them once).
+- Booth detection runs `src/run_real.py` as a subprocess per request (exact CLI
+  behaviour); expect a few seconds of process/model warm-up on top of detection.
+- Never commit the real `.env` (it's gitignored).

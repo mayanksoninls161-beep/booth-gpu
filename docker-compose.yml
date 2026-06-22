@@ -1,38 +1,71 @@
-# GPU server deployment for booth-gpu.
+# ============================================================================
+# Booth-GPU — Docker Compose (GPU server)
+# ----------------------------------------------------------------------------
+# Serves the same API as production:
+#   POST /predict                  icons + trails (Roboflow)
+#   POST /debug_predict            trail debug (Roboflow)
+#   POST /hall_with_booth_predict  Roboflow hall + GPU booth pipeline
+#                                  (image_url and/or pdf_url; PDF wins when both)
+#   GET  /health
+# Send header:  Authentication-API-Key: <AUTHENTICATION_API_KEY>
 #
-# Quick start on the server (after `git clone` + `cd booth-gpu`):
+#   cp .env.example .env            # fill in your keys
+#   docker compose up -d --build api
+#   curl -fsS localhost:8000/health
 #
-#   mkdir -p data out models
-#   cp /path/to/your_plan.pdf data/
-#   INPUT=/data/your_plan.pdf docker compose up --build
+# One-off CLI detection (no Roboflow keys needed):
+#   docker compose run --rm booth-cli --input /data/in/plan.pdf --fp-policy shape --outdir /data/out
 #
-# `docker compose up` builds the image (first time) and runs the pipeline on
-# $INPUT, writing results to ./out. Tune behaviour with the other env vars below,
-# e.g.:
-#   INPUT=/data/plan.jpg FP_POLICY=strict docker compose up
-#   INPUT=/data/plan.pdf EXTRA_ARGS="--dpi 300 --workers 8" docker compose up --build
-#
-# Requires the NVIDIA Container Toolkit on the host. Verify with:
+# Requires the NVIDIA Container Toolkit on the host. Verify:
 #   docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
+# ============================================================================
 services:
-  booth:
+  api:
     build: .
     image: booth-gpu:latest
+    container_name: booth-gpu-api
     gpus: all
+    env_file:
+      - .env
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      # Optional Roboflow hall-model key (only used with --roboflow-hall).
-      # Passed from host env; never baked into the image.
-      - ROBOFLOW_HALL_API_KEY=${ROBOFLOW_HALL_API_KEY:-}
+      - S3_WRITEBACK_ENABLED=false
+      - HALL_RASTER_MAX_EDGE=2048
+      - BOOTH_DPI=250
+      - BOOTH_FP_POLICY=shape
+    ports:
+      - "${API_PORT:-8000}:8000"
     volumes:
-      - ./data:/data       # put input plans here
-      - ./out:/data/out    # results land here (*_boxes.json / *.png)
-      - ./models:/models   # EasyOCR weights persist across runs
-    # Run the pipeline on $INPUT. Override knobs via env (see header).
-    command: >
-      --input ${INPUT:?set INPUT=/data/<your_plan>.pdf}
-      --fp-policy ${FP_POLICY:-shape}
-      --ocr ${OCR:-auto}
-      --outdir /data/out
-      ${EXTRA_ARGS:-}
+      - ./data:/data
+      - ./models:/models           # EasyOCR weights
+      - model-cache:/root/.cache   # Roboflow/HF model downloads
+      - easyocr-cache:/root/.EasyOCR
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 180s
+    restart: unless-stopped
+
+  # One-off CLI detection (no API/Roboflow needed). Not started by `up`.
+  booth-cli:
+    build: .
+    image: booth-gpu:latest
+    gpus: all
+    working_dir: /app
+    entrypoint: ["python", "src/run_real.py"]
+    command: ["--help"]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ./data:/data
+      - ./models:/models
+      - easyocr-cache:/root/.EasyOCR
+    profiles: ["cli"]
+
+volumes:
+  model-cache:
+  easyocr-cache:
