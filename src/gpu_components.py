@@ -28,6 +28,59 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+# --------------------------------------------------------------------------- #
+# Optional cuCIM (RAPIDS) backend: a real GPU union-find connected-components
+# (cucim.skimage.measure.label) that converges in a few passes instead of the
+# O(component-diameter) rounds the label-propagation path needs. This is the one
+# step where label-propagation loses to cv2 (huge background blobs), so cuCIM is
+# what makes the GPU geometric pass actually beat the CPU. If cuCIM/CuPy are not
+# installed we silently fall back to label propagation (identical results).
+#   Colab install:  pip install cupy-cuda12x cucim-cu12
+# --------------------------------------------------------------------------- #
+try:
+    import cupy as _cp
+    from cucim.skimage.measure import label as _cucim_label
+    _HAS_CUCIM = True
+except Exception:
+    _HAS_CUCIM = False
+
+_CCL_BACKEND = "prop"   # "prop" (label propagation) | "cucim"
+
+
+def cucim_available() -> bool:
+    return _HAS_CUCIM
+
+
+def set_ccl_backend(name: str):
+    """Choose the GPU connected-components backend: 'prop' or 'cucim'.
+
+    'cucim' silently degrades to 'prop' if RAPIDS cuCIM is not importable, so it
+    is always safe to request. Returns the backend actually selected."""
+    global _CCL_BACKEND
+    _CCL_BACKEND = "cucim" if (name == "cucim" and _HAS_CUCIM) else "prop"
+    return _CCL_BACKEND
+
+
+def get_ccl_backend() -> str:
+    return _CCL_BACKEND
+
+
+def _label_cucim(mask, connectivity):
+    """Binary mask [H,W] or [1,1,H,W] CUDA tensor -> int64 label image [H,W].
+
+    Uses cuCIM's GPU CCL via a zero-copy CuPy<->Torch handoff (CUDA array
+    interface in, DLPack out). connectivity 4 -> skimage conn 1; 8 -> 2."""
+    m = mask
+    if m.ndim == 4:
+        m = m.view(m.shape[-2], m.shape[-1])
+    elif m.ndim != 2:
+        m = m.view(*m.shape[-2:])
+    m = m.contiguous()
+    cm = _cp.asarray(m) != 0                      # zero-copy view of the torch tensor
+    conn = 1 if connectivity == 4 else 2
+    lab = _cucim_label(cm, connectivity=conn)     # CuPy int label image, 0 = bg
+    return torch.from_dlpack(lab.toDlpack()).to(torch.int64)
+
 
 def _max_pool_neighbors(labels, connectivity=8, ksize=3):
     """One round of 'each pixel takes the max label in its k x k window'."""
@@ -65,6 +118,10 @@ def label_components_gpu(mask, connectivity=8, max_iters=4096, check_every=8):
       for the fixed point every `check_every` rounds (a few extra cheap max_pool
       rounds is far cheaper than a sync per round).
     """
+    # Fast path: RAPIDS cuCIM union-find CCL (O(few passes) vs O(diameter)).
+    if _CCL_BACKEND == "cucim" and _HAS_CUCIM and mask.is_cuda:
+        return _label_cucim(mask, connectivity)
+
     m = mask
     if m.ndim == 2:
         m = m.view(1, 1, *m.shape)

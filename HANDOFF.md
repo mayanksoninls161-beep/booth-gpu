@@ -69,7 +69,14 @@ Moves the geometric pass's CPU-bound CV ops onto the GPU as pure torch tensor op
 
 - `_subdivide`, tilt (`HoughLinesP`), `_dedupe_prefer_fine` stay on CPU (cheap / rare / many tiny ops).
 - **Fidelity gate:** `geometric_gpu.verify_gpu_vs_cpu(tile_bgr)` returns `{cpu_boxes, gpu_boxes, gpu_matched_to_cpu, recall_vs_cpu, cpu_ms, gpu_ms, speedup}`. Run it in Colab on a real tile and check `recall_vs_cpu` before switching the default to gpu.
-- **Not yet numerically validated** (built without a local CUDA env). Needs a Colab pass.
+- **Fidelity confirmed (Colab):** `--geo-backend gpu` reproduced the CPU run exactly (957 opencv_strict, 1188 kept). The `medianBlur→morphology` substitution is safe.
+
+### Connected-components backend (the speed bottleneck)
+The first GPU run was **correct but not faster** (detect ~142 s, same as CPU). Root cause: the GPU CCL is **label propagation** — iterative 3×3 max-pool, cost **O(component diameter)**. The `floodFill`→CCL and `fill_holes`→CCL reformulations run CCL on huge background blobs (diameter ≈ full tile), the worst case. cv2's CCL/floodFill are optimized union-find/scanline and win there.
+
+**Fix:** `--ccl {prop,cucim,auto}` (default `auto`). `cucim` uses RAPIDS `cucim.skimage.measure.label` — a real union-find GPU CCL (few passes, not O(diameter)) — via a zero-copy CuPy↔Torch handoff in `gpu_components._label_cucim`. It transparently accelerates **both** the geometric and color CCL. Falls back to `prop` (identical results) if cuCIM isn't installed.
+- **Colab install:** `pip install cupy-cuda12x cucim-cu12`
+- With `--geo-backend gpu`, the runner now defaults to **1 worker** (GPU work serializes on one CUDA context; CPU threads only add contention).
 
 ### `src/geometric.py` — params corrected to match prod's `Params`
 - `line_len_frac: 0.03 → 0.020`

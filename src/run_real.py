@@ -606,6 +606,20 @@ def run(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     import cv2
     print(f"device={device}  input={args.input}")
+
+    # Resolve the GPU connected-components backend once. cuCIM (RAPIDS) is a real
+    # union-find CCL that converges in a few passes; label propagation is
+    # O(component diameter) and loses to cv2 on big background blobs. 'auto' uses
+    # cuCIM when importable, else falls back to propagation (identical results).
+    import gpu_components
+    want_ccl = "cucim" if args.ccl in ("cucim", "auto") else "prop"
+    got_ccl = gpu_components.set_ccl_backend(want_ccl)
+    if args.ccl in ("cucim", "auto"):
+        if got_ccl == "cucim":
+            print("  CCL backend: cuCIM (RAPIDS union-find, GPU)")
+        else:
+            print("  CCL backend: label-propagation (cuCIM not installed; "
+                  "`pip install cupy-cuda12x cucim-cu12` for the fast path)")
     print("per-stage timing (each line is that stage only):")
     prof = Profiler()
 
@@ -657,8 +671,16 @@ def run(args):
         # safely across threads on one CUDA context. The limit is CPU cores, not
         # the GPU -- free Colab T4 boxes typically expose ~2 vCPUs, so the speedup
         # there is ~1.5-2x; a many-core host scales much further. --workers caps it.
-        n_workers = max(1, args.workers if args.workers > 0
-                        else min(8, os.cpu_count() or 4))
+        # When the geometric pass runs on the GPU the per-tile detect is
+        # GPU-bound, and CPU worker threads only serialize on the single CUDA
+        # context (no parallelism, extra contention) -- so default to 1 worker.
+        _geo_gpu = args.geo_backend == "gpu" or (
+            args.geo_backend == "auto" and torch.cuda.is_available())
+        if _geo_gpu and args.workers == 0:
+            n_workers = 1
+        else:
+            n_workers = max(1, args.workers if args.workers > 0
+                            else min(8, os.cpu_count() or 4))
         if n_workers > 1:
             try:
                 import cv2 as _cv2
@@ -921,7 +943,10 @@ def run(args):
     prof.summary()
     print("\n=== detect-stage breakdown (summed over tiles) ===")
     print(f"  [{mask_ms_tot:8.1f} ms]  colour mask + morphology (GPU)")
-    print(f"  [{cc_ms_tot:8.1f} ms]  connected components (backend={args.cc})")
+    _geo_b = args.geo_backend if args.geo_backend != "auto" else (
+        "gpu" if torch.cuda.is_available() else "cpu")
+    print(f"  [{cc_ms_tot:8.1f} ms]  connected components "
+          f"(geo={_geo_b}, ccl={gpu_components.get_ccl_backend()})")
     print(f"\nsaved: {boxes_png}")
     print(f"saved: {mask_png}")
     if hall_json_path:
@@ -961,6 +986,11 @@ def main():
                     help="[geometric] CV backend: 'cpu' = stock OpenCV (exact prod), "
                          "'gpu' = CUDA torch reimplementation (geometric_gpu), "
                          "'auto' = gpu when CUDA is available else cpu")
+    ap.add_argument("--ccl", choices=["prop", "cucim", "auto"], default="auto",
+                    help="GPU connected-components algorithm: 'prop' = label "
+                         "propagation (slow on big blobs), 'cucim' = RAPIDS "
+                         "union-find (fast; needs cupy+cucim), 'auto' = cucim if "
+                         "installed else prop")
     ap.add_argument("--line-thresh", type=int, default=128,
                     help="[bordered] pixels darker than this are grid lines/borders (0..255)")
     ap.add_argument("--seal-ksize", type=int, default=3,
