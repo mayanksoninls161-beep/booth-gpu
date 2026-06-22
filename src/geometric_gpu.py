@@ -253,28 +253,42 @@ def _shape_filter_to_list(st, p, total, H, W, source):
     return out
 
 
-def _extract_booths_gpu(bgr, S, V, gray, p, source, line_len, H, W):
+def _fg_base_gpu(bgr, S, V, p, H, W):
+    """Foreground BEFORE cutting lines — this stage is independent of line_len, so
+    it is computed once and reused for every line-length pass. Holds the three
+    expensive big-background CCLs (walkway / border-flood / fill_holes)."""
     total = H * W
     walkway = _gray_walkway_gpu(S, V, p, H, W)
     page_bg, _ = _page_background_gpu(bgr, S, V, walkway, p, H, W)
-    cuts = _cut_lines_gpu(S, gray, p, line_len, H, W)
     dark = (V < p.dark_barrier).to(torch.uint8)
     excluded = (page_bg | walkway | dark)
     fg = (1 - excluded).to(torch.uint8)
-    fg = _fill_holes_gpu(fg, 6e-4 * total, H, W)
-    fg = (fg & (1 - cuts)).to(torch.uint8)
+    return _fill_holes_gpu(fg, 6e-4 * total, H, W)
+
+
+def _cells_from_base(fg_base, cuts, p, total, H, W, source):
+    fg = (fg_base & (1 - cuts)).to(torch.uint8)
     fg = _erode(fg, 3, 3)
     st = components_stats_gpu(fg, connectivity=4)
     return _shape_filter_to_list(st, p, total, H, W, source)
 
 
-def _bright_cells_gpu(S, gray, p, line_len, H, W):
+def _extract_booths_gpu(bgr, S, V, gray, p, source, line_len, H, W):
+    """Self-contained extract (used by the rare tilt path, which works on a freshly
+    rotated crop). The main axis passes use _fg_base_gpu + _cells_from_base."""
+    fg_base = _fg_base_gpu(bgr, S, V, p, H, W)
+    cuts = _cut_lines_gpu(S, gray, p, line_len, H, W)
+    return _cells_from_base(fg_base, cuts, p, H * W, H, W, source)
+
+
+def _bright_cells_gpu(S, gray, p, line_len, H, W, cuts=None):
     total = H * W
     k = max(31, (min(H, W) // 20) | 1)
     floor = _gray_open(gray, k)                       # ~medianBlur for bright floor
     bright = ((gray - floor) > p.bright_cell_contrast).to(torch.uint8)
     bright = _open(bright, 3, 3)
-    cuts = _cut_lines_gpu(S, gray, p, line_len, H, W)
+    if cuts is None:
+        cuts = _cut_lines_gpu(S, gray, p, line_len, H, W)
     fg = (bright & (1 - cuts)).to(torch.uint8)
     fg = _fill_holes_gpu(fg, 6e-4 * total, H, W)
     fg = _erode(fg, 3, 3)
@@ -295,16 +309,30 @@ def detect_array_gpu(bgr, p: Optional[GeoParams] = None, source="opencv_strict")
     device = _device()
     _, _, _, V, S, gray, H, W = _bgr_to_planes(bgr, device)
 
+    total = H * W
     cands = []
+
+    # The walkway / border-flood / fill_holes stages are line_len-independent:
+    # compute the foreground base ONCE, then only re-cut lines per length.
+    fg_base = _fg_base_gpu(bgr, S, V, p, H, W)
+    _cut_cache = {}
+
+    def cuts_for(ll):
+        key = round(float(ll), 6)
+        if key not in _cut_cache:
+            _cut_cache[key] = _cut_lines_gpu(S, gray, p, ll, H, W)
+        return _cut_cache[key]
+
     for ll in (p.line_len_frac, p.line_len_frac * 0.55):
-        cands += _extract_booths_gpu(bgr, S, V, gray, p, "axis", ll, H, W)
+        cands += _cells_from_base(fg_base, cuts_for(ll), p, total, H, W, "axis")
     if p.enable_bright:
-        cands += _bright_cells_gpu(S, gray, p, p.line_len_frac, H, W)
+        cands += _bright_cells_gpu(S, gray, p, p.line_len_frac, H, W,
+                                   cuts=cuts_for(p.line_len_frac))
 
     # tilt detection: rare, HoughLinesP -> keep on CPU via the reference impl
     if p.enable_tilt:
-        cuts_np = (_cut_lines_gpu(S, gray, p, None, H, W).view(H, W)
-                   .to(torch.uint8).cpu().numpy() * 255)
+        # tilt uses the default line length, which is already cached
+        cuts_np = (cuts_for(p.line_len_frac).view(H, W).to(torch.uint8).cpu().numpy() * 255)
         ang = geometric._dominant_tilt(cuts_np, p)
         if ang is not None and abs(ang) > p.tilt_min_deg:
             import cv2
