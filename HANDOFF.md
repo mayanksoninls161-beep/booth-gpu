@@ -63,13 +63,14 @@ Moves the geometric pass's CPU-bound CV ops onto the GPU as pure torch tensor op
 | `connectedComponentsWithStats` (CPU-only, serial) | label-propagation CCL → `gpu_components.components_stats_gpu` (boxes + areas + centroids, vectorised) |
 | `floodFill` (border flood, serial) | "CCL components touching the image border" + `isin` — parallel, equivalent |
 | `fill_holes` | CCL on inverted mask + area cap |
-| `medianBlur(31)` | grayscale morphological **close** (dark-line floor) / **open** (bright-cell floor) — **the one approximation, not bit-exact** |
+| `medianBlur(k)` | **exact cv2.medianBlur on CPU, floor re-uploaded** (`_median_floor`). Not the bottleneck (CCL is). The earlier morphological close/open approximation bled bright cells into adjacent darker cells → dropped 159 small booths on IIJS; now bit-exact. |
 | `Sobel` / morphology OPEN/CLOSE | `conv2d` / rectangular max/avg-pool (`(1,L)`/`(L,1)` line elements) |
 | `cvtColor BGR→HSV/GRAY` | exact — pass uses only V(=max) and S, never H |
 
 - `_subdivide`, tilt (`HoughLinesP`), `_dedupe_prefer_fine` stay on CPU (cheap / rare / many tiny ops).
 - **Fidelity gate:** `geometric_gpu.verify_gpu_vs_cpu(tile_bgr)` returns `{cpu_boxes, gpu_boxes, gpu_matched_to_cpu, recall_vs_cpu, cpu_ms, gpu_ms, speedup}`. Run it in Colab on a real tile and check `recall_vs_cpu` before switching the default to gpu.
-- **Fidelity confirmed (Colab):** `--geo-backend gpu` reproduced the CPU run exactly (957 opencv_strict, 1188 kept). The `medianBlur→morphology` substitution is safe.
+- **Fidelity confirmed (Colab, AMFloorplan):** `--geo-backend gpu` reproduced the CPU run exactly (957 opencv_strict, 1188 kept).
+- **IIJS fidelity fix:** the original `medianBlur→close/open` substitution silently dropped **159 small (~64px) opencv_strict cells** that prod finds with score 1.0 (GPU boothlike recall vs prod was 80%, 162 true-miss + 28 fused). The k//2-px morphological dilate bled a bright cell's value into an adjacent darker-fill cell, so `bg − gray` read large across the whole dark cell → it was cut out as a "grid line". Replaced with exact `_median_floor` (CPU cv2.medianBlur). Re-run IIJS to confirm recall recovery.
 
 ### Connected-components backend (the speed bottleneck)
 The first GPU run was **correct but not faster** (detect ~142 s, same as CPU). Root cause: the GPU CCL is **label propagation** — iterative 3×3 max-pool, cost **O(component diameter)**. The `floodFill`→CCL and `fill_holes`→CCL reformulations run CCL on huge background blobs (diameter ≈ full tile), the worst case. cv2's CCL/floodFill are optimized union-find/scanline and win there.

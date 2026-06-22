@@ -24,11 +24,11 @@ How each maps to the GPU (all torch tensors, no CPU round-trip):
                         parallel and equivalent to a flood from every border seed.
   fill_holes          : CCL on the inverted mask, keep interior comps under the
                         hole-area cap (same as the cv2 version, GPU CCL).
-  medianBlur(k)       : replaced by grayscale morphological CLOSE (for dark-line
-                        floor) / OPEN (for bright-cell floor). This is the
-                        standard background-floor estimator and is the ONE op
-                        that is an approximation rather than a bit-exact port
-                        (see verify_gpu_vs_cpu()).
+  medianBlur(k)       : the EXACT cv2.medianBlur is run on the CPU once per tile
+                        and the floor re-uploaded (_median_floor). It is not the
+                        bottleneck (CCL is), and a morphological close/open
+                        approximation bled bright cells into adjacent darker cells
+                        -> 159 small booths silently dropped on IIJS. Bit-exact now.
   Sobel / morphology  : conv2d / rectangular max/avg-pool.
 
 The localized `_subdivide`, tilt detection (HoughLinesP) and `_dedupe_prefer_fine`
@@ -111,22 +111,27 @@ def _close(mask, kh, kw):
     return _erode(_dilate(mask, kh, kw), kh, kw)
 
 
-def _gray_dilate(x, k):
-    xp = _pad_same(x, k, k, float(x.min()))
-    return F.max_pool2d(xp, (k, k), stride=1)
+def _median_floor(gray, k):
+    """Exact cv2.medianBlur(k) background floor, computed on CPU and re-uploaded.
 
-
-def _gray_erode(x, k):
-    xp = _pad_same(x, k, k, float(x.max()))
-    return -F.max_pool2d(-xp, (k, k), stride=1)
-
-
-def _gray_close(x, k):   # fills DARK thin features -> bright floor (for dark-line detect)
-    return _gray_erode(_gray_dilate(x, k), k)
-
-
-def _gray_open(x, k):    # removes BRIGHT thin features -> dark floor (for bright-cell detect)
-    return _gray_dilate(_gray_erode(x, k), k)
+    PROD uses medianBlur to estimate a per-pixel background that the line / bright
+    cell detectors subtract against. The earlier GPU port approximated it with a
+    grayscale morphological close/open, but those BLEED: a k//2-px dilate spreads a
+    bright cell's value into an adjacent DARKER-fill cell, so `bg - gray` reads
+    large across the *whole* dark cell -> it is treated as a grid line, cut out of
+    the foreground, and the booth vanishes. On the IIJS plan this silently dropped
+    159 small (~64px) opencv_strict cells that PROD finds with score 1.0. A true
+    median ignores thin features without that bleed. medianBlur is NOT the pipeline
+    bottleneck (connected-components is), so running the exact cv2 op on CPU and
+    uploading the result restores fidelity at negligible cost (~15 ms / tile)."""
+    import cv2
+    k = int(k) | 1                                   # cv2 requires odd kernel
+    g = gray
+    if g.dim() == 4:
+        g = g[0, 0]
+    g_np = torch.clamp(g, 0, 255).to(torch.uint8).cpu().numpy()
+    bg = cv2.medianBlur(g_np, k)
+    return torch.as_tensor(bg, device=gray.device).to(gray.dtype).view_as(gray)
 
 
 def _sobel_mag(x):
@@ -167,8 +172,9 @@ def _gray_walkway_gpu(S, V, p, H, W):
     return (st["labels"] == (big + 1)).view(1, 1, H, W).to(torch.uint8)
 
 
-def _cut_lines_gpu(S, gray, p, line_len, H, W):
-    bg = _gray_close(gray, 31)                       # ~medianBlur(31) for dark floor
+def _cut_lines_gpu(S, gray, p, line_len, H, W, bg=None):
+    if bg is None:
+        bg = _median_floor(gray, 31)                 # exact cv2.medianBlur(31), dark floor
     darker = bg - gray
     dark_mask = (darker > p.cut_contrast).to(torch.uint8)
     # bright_mask uses bright_contrast=255 in prod -> always empty; skip.
@@ -281,10 +287,11 @@ def _extract_booths_gpu(bgr, S, V, gray, p, source, line_len, H, W):
     return _cells_from_base(fg_base, cuts, p, H * W, H, W, source)
 
 
-def _bright_cells_gpu(S, gray, p, line_len, H, W, cuts=None):
+def _bright_cells_gpu(S, gray, p, line_len, H, W, cuts=None, floor=None):
     total = H * W
-    k = max(31, (min(H, W) // 20) | 1)
-    floor = _gray_open(gray, k)                       # ~medianBlur for bright floor
+    if floor is None:
+        k = max(31, (min(H, W) // 20) | 1)
+        floor = _median_floor(gray, k)                # exact cv2.medianBlur(k), bright floor
     bright = ((gray - floor) > p.bright_cell_contrast).to(torch.uint8)
     bright = _open(bright, 3, 3)
     if cuts is None:
@@ -315,12 +322,15 @@ def detect_array_gpu(bgr, p: Optional[GeoParams] = None, source="opencv_strict")
     # The walkway / border-flood / fill_holes stages are line_len-independent:
     # compute the foreground base ONCE, then only re-cut lines per length.
     fg_base = _fg_base_gpu(bgr, S, V, p, H, W)
+    # medianBlur(31) floor is line_len-independent -> compute the exact cv2 median
+    # ONCE and reuse for every cut-line pass (and for bright cells below).
+    cut_bg = _median_floor(gray, 31)
     _cut_cache = {}
 
     def cuts_for(ll):
         key = round(float(ll), 6)
         if key not in _cut_cache:
-            _cut_cache[key] = _cut_lines_gpu(S, gray, p, ll, H, W)
+            _cut_cache[key] = _cut_lines_gpu(S, gray, p, ll, H, W, bg=cut_bg)
         return _cut_cache[key]
 
     for ll in (p.line_len_frac, p.line_len_frac * 0.55):
