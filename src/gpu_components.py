@@ -147,3 +147,60 @@ def components_boxes_gpu(mask, connectivity=8, min_area=1, max_iters=256):
         idx = torch.argsort(boxes[order, col], stable=True)
         order = order[idx]
     return boxes[order]
+
+
+def components_stats_gpu(mask, connectivity=4, max_iters=256):
+    """connectedComponentsWithStats equivalent, on GPU.
+
+    Returns a dict with everything the geometric shape-filters need:
+      labels   : int64 [H,W] relabelled 1..M contiguous (0 = background)
+      boxes    : int64 [M,4]  (x, y, w, h)   -- cv2 stats layout (NOT x2y2)
+      areas    : int64 [M]    pixel count per component (cv2 CC_STAT_AREA)
+      centroids: float32 [M,2] (cx, cy)       -- cv2 centroids
+    Component k (0-based row) carries label (k+1) in `labels`. Empty mask -> M=0.
+    """
+    raw = label_components_gpu(mask, connectivity=connectivity, max_iters=max_iters)
+    H, W = raw.shape
+    device = raw.device
+    flat = raw.view(-1)
+    fg = flat > 0
+    if int(fg.sum().item()) == 0:
+        return {"labels": torch.zeros((H, W), dtype=torch.int64, device=device),
+                "boxes": torch.zeros((0, 4), dtype=torch.int64, device=device),
+                "areas": torch.zeros((0,), dtype=torch.int64, device=device),
+                "centroids": torch.zeros((0, 2), dtype=torch.float32, device=device)}
+
+    lab = flat[fg]
+    uniq, inv = torch.unique(lab, return_inverse=True)      # inv in [0, M)
+    M = uniq.numel()
+
+    ys = torch.arange(H, device=device).view(H, 1).expand(H, W).reshape(-1)[fg].to(torch.int64)
+    xs = torch.arange(W, device=device).view(1, W).expand(H, W).reshape(-1)[fg].to(torch.int64)
+
+    big = torch.iinfo(torch.int64).max
+    x1 = torch.full((M,), big, device=device, dtype=torch.int64)
+    y1 = torch.full((M,), big, device=device, dtype=torch.int64)
+    x2 = torch.full((M,), -1, device=device, dtype=torch.int64)
+    y2 = torch.full((M,), -1, device=device, dtype=torch.int64)
+    x1.scatter_reduce_(0, inv, xs, reduce="amin", include_self=True)
+    y1.scatter_reduce_(0, inv, ys, reduce="amin", include_self=True)
+    x2.scatter_reduce_(0, inv, xs, reduce="amax", include_self=True)
+    y2.scatter_reduce_(0, inv, ys, reduce="amax", include_self=True)
+
+    areas = torch.zeros((M,), device=device, dtype=torch.int64)
+    areas.scatter_reduce_(0, inv, torch.ones_like(inv), reduce="sum", include_self=True)
+    sx = torch.zeros((M,), device=device, dtype=torch.float64)
+    sy = torch.zeros((M,), device=device, dtype=torch.float64)
+    sx.scatter_reduce_(0, inv, xs.to(torch.float64), reduce="sum", include_self=True)
+    sy.scatter_reduce_(0, inv, ys.to(torch.float64), reduce="sum", include_self=True)
+    centroids = torch.stack([sx / areas, sy / areas], dim=1).to(torch.float32)
+
+    boxes = torch.stack([x1, y1, x2 - x1 + 1, y2 - y1 + 1], dim=1)  # x,y,w,h
+
+    # Relabel the image to contiguous 1..M so callers can do (labels == k).
+    relabel = torch.zeros(int(uniq.max().item()) + 1, dtype=torch.int64, device=device)
+    relabel[uniq] = torch.arange(1, M + 1, device=device)
+    labels = torch.zeros_like(flat)
+    labels[fg] = relabel[lab]
+    return {"labels": labels.view(H, W), "boxes": boxes, "areas": areas,
+            "centroids": centroids}

@@ -260,8 +260,15 @@ def _geometric_boxes(crop_bgr, args, geo_params):
     """Geometric line-based cell extraction (prod source 'opencv_strict').
     Returns (boxes_as_source_dicts, mask_ms, cc_ms); boxes are CROP-LOCAL with a
     'source' tag and optional oriented 'coords'."""
+    backend = getattr(args, "geo_backend", "cpu")
+    if backend == "auto":
+        backend = "gpu" if torch.cuda.is_available() else "cpu"
     t0 = time.perf_counter()
-    dets = geometric.detect_array(crop_bgr, geo_params, source="opencv_strict")
+    if backend == "gpu":
+        import geometric_gpu
+        dets = geometric_gpu.detect_array_gpu(crop_bgr, geo_params, source="opencv_strict")
+    else:
+        dets = geometric.detect_array(crop_bgr, geo_params, source="opencv_strict")
     cc_ms = (time.perf_counter() - t0) * 1e3
     out = []
     for d in dets:
@@ -950,6 +957,10 @@ def main():
                          "both (colour+bordered), or all (full prod ensemble; default)")
     ap.add_argument("--no-geo-tilt", action="store_true",
                     help="[geometric] disable the oriented (tilted-hall) pass for speed")
+    ap.add_argument("--geo-backend", choices=["cpu", "gpu", "auto"], default="cpu",
+                    help="[geometric] CV backend: 'cpu' = stock OpenCV (exact prod), "
+                         "'gpu' = CUDA torch reimplementation (geometric_gpu), "
+                         "'auto' = gpu when CUDA is available else cpu")
     ap.add_argument("--line-thresh", type=int, default=128,
                     help="[bordered] pixels darker than this are grid lines/borders (0..255)")
     ap.add_argument("--seal-ksize", type=int, default=3,
