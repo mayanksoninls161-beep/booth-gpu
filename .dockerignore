@@ -1,0 +1,17 @@
+.git
+.gitignore
+**/__pycache__/
+*.pyc
+out/
+data/
+models/
+fixtures/
+tests/
+*.ipynb
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.json
+HANDOFF.md
+README.md

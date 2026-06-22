@@ -1,0 +1,27 @@
+# GPU server deployment for booth-gpu.
+#
+#   docker compose build
+#   # put a plan in ./data, then:
+#   docker compose run --rm booth --input /data/myplan.pdf --fp-policy shape --outdir /data/out
+#
+# Requires the NVIDIA Container Toolkit on the host (nvidia-smi must work in a
+# test container: `docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi`).
+services:
+  booth:
+    build: .
+    image: booth-gpu:latest
+    # GPU access (modern Docker / Compose v2).
+    gpus: all
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # Roboflow hall model key (optional; only needed with --roboflow-hall).
+      # Pass it from the host env, never bake it into the image.
+      - ROBOFLOW_HALL_API_KEY=${ROBOFLOW_HALL_API_KEY:-}
+    volumes:
+      # Inputs + outputs.
+      - ./data:/data
+      # Persist downloaded EasyOCR + model weights across runs.
+      - ./models:/models
+    # Default command shows help; override on the CLI (see header).
+    command: ["--help"]
